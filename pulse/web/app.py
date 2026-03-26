@@ -2131,7 +2131,29 @@ def get_dashboard_html() -> str:
                 if (isRunning) {
                     // Running: read from run status API (includes live step states)
                     if (runStatus.steps && runStatus.steps.length > 0) {
-                        steps = runStatus.steps;
+                        // Normalize: parse "name" into repo_full_name + step_name
+                        steps = runStatus.steps.map(s => {
+                            const name = s.name || '';
+                            let repo_full_name = '', step_name = '';
+                            if (name === 'global/synthesis') {
+                                repo_full_name = '__global__'; step_name = 'synthesis';
+                            } else if (name.startsWith('fetch/')) {
+                                repo_full_name = name.replace('fetch/', ''); step_name = 'fetch';
+                            } else {
+                                // "Display Name/dim" → find matching repo
+                                const lastSlash = name.lastIndexOf('/');
+                                if (lastSlash > 0) {
+                                    const dn = name.substring(0, lastSlash);
+                                    step_name = name.substring(lastSlash + 1);
+                                    // find full_name from display_name
+                                    const match = repos.find(r => r.display_name === dn);
+                                    repo_full_name = match ? match.full_name : dn;
+                                } else {
+                                    repo_full_name = name; step_name = 'unknown';
+                                }
+                            }
+                            return { ...s, repo_full_name, step_name, _liveStatus: s.status };
+                        });
                         date = new Date().toISOString().slice(0, 10);
                     }
                 }
