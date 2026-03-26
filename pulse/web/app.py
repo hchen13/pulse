@@ -1755,7 +1755,7 @@ def get_dashboard_html() -> str:
             }
         }
 
-        // ── WS 迷你 API 文档 ─────────────────────────────────────────────────────────
+        // ── WS API 文档 modal ────────────────────────────────────────────────────────
 
         let _wsInfoLang = 'js';
 
@@ -1769,18 +1769,18 @@ def get_dashboard_html() -> str:
             });
         }
 
-        async function refreshWsInfo() {
-            const el = document.getElementById('ws-info-area');
-            if (!el) return;
-            try {
-                const s = await fetchJSON('api/ws/status');
-                const wsUrl = (() => {
-                    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-                    return `${proto}//${location.host}${_basePath}/ws`;
-                })();
-                const connStatus = _wsConnected
-                    ? '<span style="color:#9ece6a;">已连接 ✓</span>'
-                    : '<span style="color:#f7768e;">未连接 ✗</span>';
+        function openWsApiModal() {
+            const wsUrl = (() => {
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                return `${proto}//${location.host}${_basePath}/ws`;
+            })();
+            const connStatus = _wsConnected
+                ? '<span style="color:#9ece6a;">已连接 ✓</span>'
+                : '<span style="color:#f7768e;">未连接 ✗</span>';
+
+            // fetch client count async, then render
+            fetchJSON('api/ws/status').then(s => {
+                const clients = s.clients;
 
                 const jsCode =
 `const ws = new WebSocket('${wsUrl}');
@@ -1833,50 +1833,48 @@ websocat -v ${wsUrl}`;
                     ['data.repos',         'string[]', '本次分析的项目 display_name 列表'],
                     ['data.dashboard_url', 'string',   'Dashboard 访问地址'],
                 ].map(([field, type, desc]) => `
-                                    <tr>
-                                        <td style="padding:6px 10px;border:1px solid #2a2d3e;font-family:monospace;font-size:12px;color:#f7768e;">${field}</td>
-                                        <td style="padding:6px 10px;border:1px solid #2a2d3e;color:#bb9af7;font-size:12px;">${type}</td>
-                                        <td style="padding:6px 10px;border:1px solid #2a2d3e;color:#a9b1d6;font-size:12px;">${desc}</td>
-                                    </tr>`).join('');
+                                <tr>
+                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;font-family:monospace;font-size:12px;color:#f7768e;">${field}</td>
+                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;color:#bb9af7;font-size:12px;">${type}</td>
+                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;color:#a9b1d6;font-size:12px;">${desc}</td>
+                                </tr>`).join('');
 
-                el.innerHTML = `
-                    <div style="margin-top:16px;background:#1e2030;border:1px solid #2a2d3e;border-radius:8px;overflow:hidden;">
-
-                        <!-- 连接信息 -->
-                        <div style="padding:14px 16px;border-bottom:1px solid #2a2d3e;">
-                            <div style="margin-bottom:10px;">
-                                <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">连接地址</span><br>
-                                <code style="font-size:12.5px;color:#f7768e;background:#16161e;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;display:inline-block;margin-top:4px;word-break:break-all;">${wsUrl}</code>
+                document.getElementById('ws-api-modal-body').innerHTML = `
+                    <!-- 连接信息 -->
+                    <div style="padding:14px 0 16px;border-bottom:1px solid #2a2d3e;margin-bottom:18px;">
+                        <div style="margin-bottom:10px;">
+                            <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">连接地址</span><br>
+                            <code style="font-size:12.5px;color:#f7768e;background:#16161e;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;display:inline-block;margin-top:4px;word-break:break-all;">${wsUrl}</code>
+                        </div>
+                        <div style="display:flex;gap:28px;flex-wrap:wrap;">
+                            <div>
+                                <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">当前状态</span><br>
+                                <span style="font-size:13px;margin-top:3px;display:inline-block;">${connStatus}</span>
                             </div>
-                            <div style="display:flex;gap:28px;flex-wrap:wrap;">
-                                <div>
-                                    <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">当前状态</span><br>
-                                    <span style="font-size:13px;margin-top:3px;display:inline-block;">${connStatus}</span>
-                                </div>
-                                <div>
-                                    <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">在线客户端</span><br>
-                                    <span style="font-size:13px;color:#e0e2f0;margin-top:3px;display:inline-block;">${s.clients} 个</span>
-                                </div>
+                            <div>
+                                <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">在线客户端</span><br>
+                                <span style="font-size:13px;color:#e0e2f0;margin-top:3px;display:inline-block;">${clients} 个</span>
                             </div>
                         </div>
+                    </div>
 
-                        <!-- 代码示例 -->
-                        <div style="padding:14px 16px;border-bottom:1px solid #2a2d3e;">
-                            <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">订阅示例</div>
-                            <div style="display:flex;gap:0;border:1px solid #2a2d3e;border-radius:6px;overflow:hidden;width:fit-content;margin-bottom:12px;">
-                                <button id="ws-lang-js" class="pr-toggle-btn active" onclick="switchWsLang('js')">JavaScript</button>
-                                <button id="ws-lang-python" class="pr-toggle-btn" onclick="switchWsLang('python')">Python</button>
-                                <button id="ws-lang-curl" class="pr-toggle-btn" onclick="switchWsLang('curl')">curl / websocat</button>
-                            </div>
-                            <div id="ws-code-js"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${jsCode}</code></pre></div>
-                            <div id="ws-code-python" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${pyCode}</code></pre></div>
-                            <div id="ws-code-curl" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${curlCode}</code></pre></div>
+                    <!-- 代码示例 -->
+                    <div style="margin-bottom:18px;">
+                        <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">订阅示例</div>
+                        <div style="display:flex;gap:0;border:1px solid #2a2d3e;border-radius:6px;overflow:hidden;width:fit-content;margin-bottom:12px;">
+                            <button id="ws-lang-js" class="pr-toggle-btn active" onclick="switchWsLang('js')">JavaScript</button>
+                            <button id="ws-lang-python" class="pr-toggle-btn" onclick="switchWsLang('python')">Python</button>
+                            <button id="ws-lang-curl" class="pr-toggle-btn" onclick="switchWsLang('curl')">curl / websocat</button>
                         </div>
+                        <div id="ws-code-js"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${jsCode}</code></pre></div>
+                        <div id="ws-code-python" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${pyCode}</code></pre></div>
+                        <div id="ws-code-curl" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${curlCode}</code></pre></div>
+                    </div>
 
-                        <!-- 事件格式 -->
-                        <div style="padding:14px 16px;">
-                            <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">事件格式 — <code style="color:#bb9af7;font-size:11px;text-transform:none;letter-spacing:0;">report_ready</code></div>
-                            <pre style="margin:0 0 12px;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>{
+                    <!-- 事件格式 -->
+                    <div>
+                        <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">事件格式 — <code style="color:#bb9af7;font-size:11px;text-transform:none;letter-spacing:0;">report_ready</code></div>
+                        <pre style="margin:0 0 12px;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>{
   <span style="color:#7aa2f7;">"type"</span>: <span style="color:#9ece6a;">"report_ready"</span>,
   <span style="color:#7aa2f7;">"data"</span>: {
     <span style="color:#7aa2f7;">"date"</span>:          <span style="color:#9ece6a;">"2026-03-26"</span>,
@@ -1884,24 +1882,54 @@ websocat -v ${wsUrl}`;
     <span style="color:#7aa2f7;">"dashboard_url"</span>: <span style="color:#9ece6a;">"http://localhost:8765"</span>
   }
 }</code></pre>
-                            <table style="width:100%;border-collapse:collapse;">
-                                <thead>
-                                    <tr>
-                                        <th style="padding:6px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">字段</th>
-                                        <th style="padding:6px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">类型</th>
-                                        <th style="padding:6px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">说明</th>
-                                    </tr>
-                                </thead>
-                                <tbody>${schemaRows}</tbody>
-                            </table>
-                        </div>
-
+                        <table style="width:100%;border-collapse:collapse;">
+                            <thead>
+                                <tr>
+                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">字段</th>
+                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">类型</th>
+                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">说明</th>
+                                </tr>
+                            </thead>
+                            <tbody>${schemaRows}</tbody>
+                        </table>
                     </div>`;
 
-                // restore active lang tab
+                document.getElementById('ws-api-modal').classList.add('open');
+                // restore last-selected lang tab
                 switchWsLang(_wsInfoLang);
+            }).catch(() => {
+                document.getElementById('ws-api-modal-body').innerHTML =
+                    '<div class="error-msg">WS 状态加载失败</div>';
+                document.getElementById('ws-api-modal').classList.add('open');
+            });
+        }
+
+        function closeWsApiModal() {
+            document.getElementById('ws-api-modal').classList.remove('open');
+        }
+
+        async function refreshWsInfo() {
+            const el = document.getElementById('ws-info-area');
+            if (!el) return;
+            try {
+                const s = await fetchJSON('api/ws/status');
+                const wsUrl = (() => {
+                    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    return `${proto}//${location.host}${_basePath}/ws`;
+                })();
+                const connDot = _wsConnected
+                    ? '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#9ece6a;margin-right:5px;vertical-align:middle;"></span><span style="color:#9ece6a;vertical-align:middle;">已连接</span>'
+                    : '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#f7768e;margin-right:5px;vertical-align:middle;"></span><span style="color:#f7768e;vertical-align:middle;">未连接</span>';
+
+                el.innerHTML = `
+                    <div style="margin-top:12px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+                        <code style="font-size:12px;color:#f7768e;background:#1e2030;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;word-break:break-all;">${wsUrl}</code>
+                        <span style="font-size:12px;">${connDot}</span>
+                        <span style="font-size:12px;color:#565f89;">${s.clients} 客户端在线</span>
+                        <button class="btn btn-primary btn-sm" onclick="openWsApiModal()" style="margin-left:auto;">API 文档</button>
+                    </div>`;
             } catch (e) {
-                el.innerHTML = `<div class="error-msg" style="margin-top:12px;">WS 状态加载失败: ${e.message}</div>`;
+                el.innerHTML = `<div class="error-msg" style="margin-top:10px;font-size:12px;">WS 状态加载失败: ${e.message}</div>`;
             }
         }
 
@@ -2126,7 +2154,20 @@ websocat -v ${wsUrl}`;
             if (e.target === this) closeAddRepoModal();
         });
 
-        // 初始化
+        // ESC 关闭 WS API modal
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeWsApiModal();
+                closeAddRepoModal();
+            }
+        });
+
+        // 点击 WS API modal 外部关闭
+        document.getElementById('ws-api-modal').addEventListener('click', function(e) {
+            if (e.target === this) closeWsApiModal();
+        });
+
+                // 初始化
         checkRunStatus();
         loadOverview();
         loadReportDates();
@@ -2134,5 +2175,16 @@ websocat -v ${wsUrl}`;
         loadTrends();
         connectWebSocket();
     </script>
+
+    <!-- WS API 文档 Modal -->
+    <div id="ws-api-modal" class="modal-overlay">
+        <div class="modal" style="width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-shrink:0;">
+                <h3 style="margin:0;">WebSocket API</h3>
+                <button onclick="closeWsApiModal()" style="background:none;border:none;color:#565f89;font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;" title="关闭 (ESC)">✕</button>
+            </div>
+            <div id="ws-api-modal-body" style="overflow-y:auto;flex:1;"></div>
+        </div>
+    </div>
 </body>
 </html>"""
