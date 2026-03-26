@@ -219,15 +219,24 @@ def _run_full_cycle():
         analyzer = LLMAnalyzer(cfg.analysis, cfg.storage.db_path, broadcast_fn=tracked_broadcast)
 
         repo_reports = {}
-        for repo in repos:
-            logger.info(f"[run] 采集 {repo.full_name}")
-            try:
+        # 采集并行
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        logger.info(f"[run] 开始并行采集 {len(repos)} 个项目")
+        with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
+            def _fetch_repo(repo):
+                logger.info(f"[run] 采集 {repo.full_name}")
                 collector.fetch_all(repo)
-            except Exception as e:
-                logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
+                return repo.full_name
+            fetch_futures = {executor.submit(_fetch_repo, repo): repo for repo in repos}
+            for future in _as_completed(fetch_futures):
+                repo = fetch_futures[future]
+                try:
+                    future.result()
+                    logger.info(f"[run] 采集完成: {repo.full_name}")
+                except Exception as e:
+                    logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
 
         logger.info("[run] Phase 1: 维度分析（并行）")
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             future_to_repo = {executor.submit(analyzer.analyze_repo, repo, 7, run_id): repo for repo in repos}
             for future in _as_completed(future_to_repo):

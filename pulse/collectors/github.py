@@ -204,20 +204,29 @@ class GitHubCollector:
             else:
                 branches_to_check = ["main"]
 
+        # 并行拉取分支 commits（10 并发）
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_branch_commits(branch):
+            data = _run_gh([
+                "api",
+                f"repos/{full_name}/commits",
+                "--method", "GET",
+                "--field", f"sha={branch}",
+                "--field", f"per_page={self.config.max_commits_per_branch}",
+            ])
+            return branch, data or []
+
+        all_branch_data = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_branch_commits, b): b for b in branches_to_check}
+            for future in as_completed(futures):
+                branch, data = future.result()
+                all_branch_data.append((branch, data))
+
         count = 0
         with get_db(self.db_path) as conn:
-            for branch in branches_to_check:
-                data = _run_gh([
-                    "api",
-                    f"repos/{full_name}/commits",
-                    "--method", "GET",
-                    "--field", f"sha={branch}",
-                    "--field", f"per_page={self.config.max_commits_per_branch}",
-                ])
-
-                if not data:
-                    continue
-
+            for branch, data in all_branch_data:
                 for commit in data:
                     try:
                         sha = commit.get("sha", "")
