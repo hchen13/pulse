@@ -47,8 +47,15 @@ class FeishuConfig:
 
 
 @dataclass
+class WebsocketNotificationConfig:
+    enabled: bool = True
+
+
+@dataclass
 class NotificationConfig:
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
+    websocket: WebsocketNotificationConfig = field(default_factory=WebsocketNotificationConfig)
+    webhooks: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -132,7 +139,12 @@ def load_config(config_path: Optional[str] = None) -> PulseConfig:
         user_open_id=feishu_raw.get("user_open_id", ""),
         webhook_url=feishu_raw.get("webhook_url", ""),
     )
-    notification = NotificationConfig(feishu=feishu)
+    ws_raw = notif_raw.get("websocket", {})
+    websocket_notif = WebsocketNotificationConfig(
+        enabled=ws_raw.get("enabled", True),
+    )
+    webhooks = notif_raw.get("webhooks", [])
+    notification = NotificationConfig(feishu=feishu, websocket=websocket_notif, webhooks=webhooks)
 
     # 解析 web
     web_raw = raw.get("web", {})

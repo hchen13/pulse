@@ -1,13 +1,16 @@
 """FastAPI Web Dashboard — Pulse V2"""
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
+import asyncio
 import json
 import logging
+import queue
 import threading
 import re
+import requests as _requests
 import yaml
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
@@ -31,6 +34,16 @@ _run_status = {
 }
 _run_lock = threading.Lock()
 
+# WebSocket 连接列表
+_ws_clients: List[WebSocket] = []
+_ws_clients_lock = threading.Lock()
+
+# 事件队列（后台线程 → asyncio loop）
+_event_queue: queue.Queue = queue.Queue()
+
+# asyncio event loop 引用（在 create_app 时设置）
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
 
 class AddRepoRequest(BaseModel):
     url: str
@@ -44,6 +57,13 @@ class UpdateRepoRequest(BaseModel):
 
 class UpdateAgentRequest(BaseModel):
     content: str
+
+
+class SettingsRequest(BaseModel):
+    schedule_hour: Optional[int] = None
+    schedule_minute: Optional[int] = None
+    webhooks: Optional[List[str]] = None
+    websocket_enabled: Optional[bool] = None
 
 
 def _parse_github_url(url: str) -> Optional[tuple]:
@@ -81,6 +101,53 @@ def _save_repos_to_config(repos: List[RepoConfig]):
 
     with open(cfg_path, "w", encoding="utf-8") as f:
         yaml.dump(raw, f, allow_unicode=True, sort_keys=False)
+
+
+async def _broadcast_event_async(event_type: str, data: dict):
+    """异步广播 WebSocket 事件给所有连接的客户端"""
+    msg = json.dumps({"type": event_type, "data": data})
+    dead = []
+    with _ws_clients_lock:
+        clients = list(_ws_clients)
+    for ws in clients:
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        with _ws_clients_lock:
+            for ws in dead:
+                if ws in _ws_clients:
+                    _ws_clients.remove(ws)
+
+
+def broadcast_event(event_type: str, data: dict):
+    """从后台线程安全地触发 WebSocket 广播（放入事件队列）"""
+    _event_queue.put({"type": event_type, "data": data})
+
+
+def notify_webhooks(report_date: str, repos: List[str]):
+    """向所有配置的 webhook URL 发送 POST 通知"""
+    try:
+        cfg = load_config(_config_path)
+        webhooks = cfg.notification.webhooks or []
+        if not webhooks:
+            return
+        port = cfg.web.port
+        payload = {
+            "event": "report_ready",
+            "date": report_date,
+            "repos": repos,
+            "dashboard_url": f"http://localhost:{port}",
+        }
+        for url in webhooks:
+            try:
+                _requests.post(url, json=payload, timeout=10)
+                logger.info(f"[webhook] 已通知: {url}")
+            except Exception as e:
+                logger.warning(f"[webhook] 失败: {url}: {e}")
+    except Exception as e:
+        logger.warning(f"[webhook] 通知异常: {e}")
 
 
 def _run_full_cycle():
@@ -128,10 +195,19 @@ def _run_full_cycle():
         except Exception as e:
             logger.warning(f"[run] 清理失败: {e}")
 
+        report_date = datetime.now().strftime("%Y-%m-%d")
         with _run_lock:
             _run_status["running"] = False
             _run_status["finished_at"] = datetime.now().isoformat()
             _run_status["result"] = f"完成，共分析 {len(repo_reports)} 个 repo"
+
+        # 广播 WebSocket 事件
+        broadcast_event("report_ready", {
+            "date": report_date,
+            "repos": list(repo_reports.keys()),
+        })
+        # Webhook 通知
+        notify_webhooks(report_date, list(repo_reports.keys()))
 
     except Exception as e:
         logger.error(f"[run] 全局异常: {e}")
@@ -142,7 +218,7 @@ def _run_full_cycle():
 
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:
-    global _config_path, _db_path
+    global _config_path, _db_path, _event_loop
 
     _config_path = config_path
     cfg = load_config(config_path)
@@ -154,6 +230,44 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         description="监控 AI agent harness 类开源项目动态",
         version="2.0.0",
     )
+
+    @app.on_event("startup")
+    async def startup():
+        global _event_loop
+        _event_loop = asyncio.get_event_loop()
+        # 启动事件队列消费 task
+        asyncio.create_task(_event_queue_consumer())
+
+    async def _event_queue_consumer():
+        """持续消费事件队列，将事件广播到 WebSocket 客户端"""
+        while True:
+            try:
+                # 非阻塞检查队列
+                try:
+                    event = _event_queue.get_nowait()
+                    await _broadcast_event_async(event["type"], event["data"])
+                except queue.Empty:
+                    pass
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"[ws] 事件队列消费异常: {e}")
+                await asyncio.sleep(1)
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        with _ws_clients_lock:
+            _ws_clients.append(websocket)
+        logger.info(f"[ws] 客户端连接，当前连接数: {len(_ws_clients)}")
+        try:
+            while True:
+                # keep-alive：等待客户端发消息（ping 等），断连时抛异常
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            with _ws_clients_lock:
+                if websocket in _ws_clients:
+                    _ws_clients.remove(websocket)
+            logger.info(f"[ws] 客户端断开，当前连接数: {len(_ws_clients)}")
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -285,6 +399,78 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         file_path.write_text(req.content, encoding="utf-8")
         name = _ANALYST_NAMES.get(agent_id, agent_id)
         return {"id": agent_id, "name": name, "file": f".claude/analysts/{agent_id}.md", "content": req.content}
+
+    # ── Settings API ──────────────────────────────────────────────────────────────
+
+    @app.get("/api/settings")
+    async def get_settings():
+        cfg_path = _load_config_path()
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+
+        sched_raw = raw.get("schedule", {})
+        cron = sched_raw.get("cron", "0 6 * * *")
+        # 解析 cron：minute hour * * *
+        parts = cron.split()
+        hour = int(parts[1]) if len(parts) >= 2 else 6
+        minute = int(parts[0]) if len(parts) >= 1 else 0
+
+        notif_raw = raw.get("notification", {})
+        webhooks = notif_raw.get("webhooks", []) or []
+        ws_enabled = notif_raw.get("websocket", {}).get("enabled", True)
+
+        return {
+            "schedule": {"hour": hour, "minute": minute, "cron": cron},
+            "webhooks": webhooks,
+            "websocket_enabled": ws_enabled,
+        }
+
+    @app.put("/api/settings")
+    async def update_settings(req: SettingsRequest):
+        cfg_path = _load_config_path()
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+
+        if req.schedule_hour is not None and req.schedule_minute is not None:
+            cron = f"{req.schedule_minute} {req.schedule_hour} * * *"
+            raw.setdefault("schedule", {})["cron"] = cron
+        elif req.schedule_hour is not None:
+            # 只更新小时，保留分钟
+            existing = raw.get("schedule", {}).get("cron", "0 6 * * *")
+            parts = existing.split()
+            parts[1] = str(req.schedule_hour)
+            raw.setdefault("schedule", {})["cron"] = " ".join(parts)
+        elif req.schedule_minute is not None:
+            existing = raw.get("schedule", {}).get("cron", "0 6 * * *")
+            parts = existing.split()
+            parts[0] = str(req.schedule_minute)
+            raw.setdefault("schedule", {})["cron"] = " ".join(parts)
+
+        notif = raw.setdefault("notification", {})
+        if req.webhooks is not None:
+            notif["webhooks"] = req.webhooks
+        if req.websocket_enabled is not None:
+            notif.setdefault("websocket", {})["enabled"] = req.websocket_enabled
+
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump(raw, f, allow_unicode=True, sort_keys=False)
+
+        return await get_settings()
+
+    @app.post("/api/settings/test-webhook")
+    async def test_webhook(body: dict):
+        url = body.get("url", "")
+        if not url:
+            raise HTTPException(status_code=400, detail="url 不能为空")
+        try:
+            resp = _requests.post(url, json={
+                "event": "test",
+                "source": "pulse",
+                "message": "Pulse webhook 测试 payload",
+            }, timeout=10)
+            return {"status": resp.status_code, "ok": resp.ok}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
 
     # ── 立即执行 API ─────────────────────────────────────────────────────────────
 
@@ -749,6 +935,34 @@ def get_dashboard_html() -> str:
         }
         .agent-textarea:focus { border-color: #7aa2f7; }
 
+        /* ── Settings ── */
+        .settings-section { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; padding: 22px 24px; margin-bottom: 20px; }
+        .settings-section h3 { font-size: 15px; color: #e0e2f0; margin-bottom: 6px; font-weight: 600; }
+        .settings-section p.desc { font-size: 12px; color: #565f89; margin-bottom: 18px; }
+        .settings-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+        .settings-input {
+            background: #1e2030; color: #c0caf5; border: 1px solid #2a2d3e; border-radius: 6px;
+            padding: 8px 12px; font-size: 13px; outline: none; font-family: inherit;
+        }
+        .settings-input:focus { border-color: #7aa2f7; }
+        .settings-input-sm { width: 80px; }
+        .settings-input-url { width: 320px; }
+        .toggle-switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background: #2a2d3e; border-radius: 24px; transition: 0.2s;
+        }
+        .toggle-slider::before {
+            position: absolute; content: ""; height: 18px; width: 18px;
+            left: 3px; bottom: 3px; background: #565f89; border-radius: 50%; transition: 0.2s;
+        }
+        .toggle-switch input:checked + .toggle-slider { background: rgba(158,206,106,0.3); }
+        .toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); background: #9ece6a; }
+        .webhook-list { margin-top: 10px; }
+        .webhook-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .webhook-item span { flex: 1; font-size: 13px; color: #a9b1d6; word-break: break-all; }
+
         /* ── Modal ── */
         .modal-overlay {
             display: none; position: fixed; inset: 0;
@@ -798,6 +1012,7 @@ def get_dashboard_html() -> str:
             <div class="tab" onclick="switchTab('reports')">日报</div>
             <div class="tab" onclick="switchTab('trends')">趋势</div>
             <div class="tab" onclick="switchTab('agents')">Agents</div>
+            <div class="tab" onclick="switchTab('settings')">Settings</div>
         </div>
 
         <!-- 概览 -->
@@ -833,6 +1048,11 @@ def get_dashboard_html() -> str:
         <!-- Agents -->
         <div id="tab-agents" class="tab-content">
             <div id="agents-content" class="loading">加载中...</div>
+        </div>
+
+        <!-- Settings -->
+        <div id="tab-settings" class="tab-content">
+            <div id="settings-content" class="loading">加载中...</div>
         </div>
 
     </div>
@@ -882,11 +1102,12 @@ def get_dashboard_html() -> str:
         }
 
         function switchTab(name) {
-            const names = ['overview', 'reports', 'trends', 'agents'];
+            const names = ['overview', 'reports', 'trends', 'agents', 'settings'];
             document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', names[i] === name));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById(`tab-${name}`).classList.add('active');
             if (name === 'agents') loadAgents();
+            if (name === 'settings') loadSettings();
         }
 
         // ── Repo 管理 ──────────────────────────────────────────────────────────────
@@ -1504,6 +1725,216 @@ def get_dashboard_html() -> str:
             }
         }
 
+        // ── WebSocket 实时推送 ───────────────────────────────────────────────────────
+
+        let _ws = null;
+        let _wsReconnectTimer = null;
+
+        function connectWebSocket() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${proto}//${location.host}${_basePath}/ws`;
+            try {
+                _ws = new WebSocket(wsUrl);
+                _ws.onopen = () => {
+                    console.log('[ws] 已连接');
+                    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+                };
+                _ws.onmessage = (e) => {
+                    try {
+                        const msg = JSON.parse(e.data);
+                        if (msg.type === 'report_ready') {
+                            console.log('[ws] 收到 report_ready，刷新数据...');
+                            // 自动刷新当前 tab 数据
+                            const activeTab = document.querySelector('.tab.active');
+                            if (activeTab) {
+                                const tabName = activeTab.getAttribute('onclick').match(/switchTab\('(.+?)'\)/)?.[1];
+                                if (tabName === 'overview' || !tabName) {
+                                    loadOverview(); loadTodayInsight();
+                                } else if (tabName === 'reports') {
+                                    loadReportDates();
+                                } else if (tabName === 'trends') {
+                                    loadTrends();
+                                }
+                            }
+                            // 无论如何都刷新概览数据（后台）
+                            loadOverview();
+                        }
+                    } catch {}
+                };
+                _ws.onclose = () => {
+                    console.log('[ws] 连接断开，5秒后重连...');
+                    _ws = null;
+                    _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+                };
+                _ws.onerror = () => {
+                    _ws = null;
+                };
+            } catch (e) {
+                console.log('[ws] 连接失败，5秒后重试');
+                _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+            }
+        }
+
+        // ── Settings ─────────────────────────────────────────────────────────────
+
+        let _settings = {};
+
+        async function loadSettings() {
+            try {
+                _settings = await fetchJSON('api/settings');
+                renderSettings();
+            } catch (e) {
+                document.getElementById('settings-content').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        function renderSettings() {
+            const s = _settings;
+            const hour = (s.schedule || {}).hour ?? 6;
+            const minute = (s.schedule || {}).minute ?? 0;
+            const wsEnabled = s.websocket_enabled !== false;
+            const webhooks = s.webhooks || [];
+
+            let webhookItemsHtml = webhooks.map((url, i) => `
+                <div class="webhook-item" id="webhook-item-${i}">
+                    <span>${escapeHtml(url)}</span>
+                    <button class="btn btn-danger btn-sm" onclick="deleteWebhook(${i})">删除</button>
+                    <button class="btn btn-sm" style="background:#1e2030; color:#7aa2f7; border-color:#2a2d3e;" onclick="testWebhook('${escapeHtml(url)}')">测试</button>
+                </div>`).join('');
+
+            const html = `
+                <div class="settings-section">
+                    <h3>定时执行</h3>
+                    <p class="desc">本地时区，每天在指定时间自动执行采集和分析</p>
+                    <div class="settings-row">
+                        <label style="font-size:13px; color:#a9b1d6;">执行时间</label>
+                        <input type="number" id="sched-hour" class="settings-input settings-input-sm" min="0" max="23" value="${hour}" placeholder="时">
+                        <span style="color:#565f89;">时</span>
+                        <input type="number" id="sched-minute" class="settings-input settings-input-sm" min="0" max="59" value="${String(minute).padStart(2,'0')}" placeholder="分">
+                        <span style="color:#565f89;">分</span>
+                        <button class="btn btn-primary btn-sm" onclick="saveSchedule()">保存</button>
+                    </div>
+                    <div id="sched-feedback" style="font-size:12px; color:#9ece6a; margin-top:6px; display:none;"></div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>WebSocket 实时推送</h3>
+                    <p class="desc">开启后，dashboard 页面会在新报告生成时自动刷新</p>
+                    <div class="settings-row">
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="ws-toggle" ${wsEnabled ? 'checked' : ''} onchange="saveWsEnabled(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span style="font-size:13px; color:#a9b1d6;" id="ws-toggle-label">${wsEnabled ? '已开启' : '已关闭'}</span>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Webhook 通知</h3>
+                    <p class="desc">报告生成后，向以下 URL 发送 POST 请求</p>
+                    <div class="settings-row">
+                        <input type="text" id="new-webhook-url" class="settings-input settings-input-url" placeholder="https://example.com/pulse-hook">
+                        <button class="btn btn-success btn-sm" onclick="addWebhook()">添加</button>
+                    </div>
+                    <div id="webhook-error" class="error-msg" style="display:none; margin-bottom:10px;"></div>
+                    <div class="webhook-list" id="webhook-list">
+                        ${webhookItemsHtml || '<div style="color:#565f89; font-size:13px;">暂无 webhook</div>'}
+                    </div>
+                </div>`;
+
+            document.getElementById('settings-content').innerHTML = html;
+
+            // 绑定 toggle label 更新
+            document.getElementById('ws-toggle').addEventListener('change', function() {
+                document.getElementById('ws-toggle-label').textContent = this.checked ? '已开启' : '已关闭';
+            });
+        }
+
+        async function saveSchedule() {
+            const hour = parseInt(document.getElementById('sched-hour').value);
+            const minute = parseInt(document.getElementById('sched-minute').value);
+            if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(minute) || minute < 0 || minute > 59) {
+                alert('时间格式有误（小时0-23，分钟0-59）');
+                return;
+            }
+            try {
+                _settings = await fetchJSON('api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ schedule_hour: hour, schedule_minute: minute }),
+                });
+                const fb = document.getElementById('sched-feedback');
+                fb.textContent = `已保存：每天 ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')} 执行`;
+                fb.style.display = 'block';
+                setTimeout(() => { fb.style.display = 'none'; }, 3000);
+            } catch (e) {
+                alert(`保存失败: ${e.message}`);
+            }
+        }
+
+        async function saveWsEnabled(enabled) {
+            try {
+                _settings = await fetchJSON('api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ websocket_enabled: enabled }),
+                });
+            } catch (e) {
+                alert(`保存失败: ${e.message}`);
+            }
+        }
+
+        async function addWebhook() {
+            const url = document.getElementById('new-webhook-url').value.trim();
+            const errEl = document.getElementById('webhook-error');
+            errEl.style.display = 'none';
+            if (!url || !url.startsWith('http')) {
+                errEl.textContent = '请输入有效的 URL（以 http:// 或 https:// 开头）';
+                errEl.style.display = 'block';
+                return;
+            }
+            const newWebhooks = [...(_settings.webhooks || []), url];
+            try {
+                _settings = await fetchJSON('api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ webhooks: newWebhooks }),
+                });
+                document.getElementById('new-webhook-url').value = '';
+                renderSettings();
+            } catch (e) {
+                errEl.textContent = `添加失败: ${e.message}`;
+                errEl.style.display = 'block';
+            }
+        }
+
+        async function deleteWebhook(index) {
+            const newWebhooks = (_settings.webhooks || []).filter((_, i) => i !== index);
+            try {
+                _settings = await fetchJSON('api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ webhooks: newWebhooks }),
+                });
+                renderSettings();
+            } catch (e) {
+                alert(`删除失败: ${e.message}`);
+            }
+        }
+
+        async function testWebhook(url) {
+            try {
+                const r = await fetchJSON('api/settings/test-webhook', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url }),
+                });
+                alert(`测试成功，响应状态: ${r.status}`);
+            } catch (e) {
+                alert(`测试失败: ${e.message}`);
+            }
+        }
+
         // 点击 modal 外部关闭
         document.getElementById('add-repo-modal').addEventListener('click', function(e) {
             if (e.target === this) closeAddRepoModal();
@@ -1515,6 +1946,7 @@ def get_dashboard_html() -> str:
         loadReportDates();
         loadTodayInsight();
         loadTrends();
+        connectWebSocket();
     </script>
 </body>
 </html>"""

@@ -1,61 +1,39 @@
-# Pulse — AI Harness 情报系统配置
-
-# 监控的 GitHub repo 列表
 repos:
-  - owner: anthropics
-    name: claude-code
-    display_name: "Claude Code (Anthropic)"
-    enabled: true
-  - owner: openai
-    name: codex
-    display_name: "Codex (OpenAI)"
-    enabled: true
-  - owner: openclaw
-    name: openclaw
-    display_name: "OpenClaw"
-    enabled: true
-
-# 采集配置
+- owner: anthropics
+  name: claude-code
+  display_name: Claude Code (Anthropic)
+  enabled: true
+- owner: openai
+  name: codex
+  display_name: Codex (OpenAI)
+  enabled: true
+- owner: openclaw
+  name: openclaw
+  display_name: OpenClaw
+  enabled: true
 collection:
-  # 每次采集最多抓多少条（issues/PRs/commits）
   max_issues: 50
   max_prs: 30
   max_commits_per_branch: 20
   max_releases: 10
-  # watch_branches 已废弃，自动发现所有分支
-
-# 调度配置（daemon 使用）
 schedule:
-  # cron 表达式，默认每天早 8 点
-  cron: "0 8 * * *"
-  # 也可以配置多次，如 "0 8,20 * * *" 表示早 8 晚 8
-
-# 分析配置
+  cron: 0 6 * * *
 analysis:
-  # claude CLI 路径
-  claude_bin: "claude"
-  # 分析用模型
-  model: "claude-haiku-4-5"
-  # 每个 repo 分析的最大 token 输出
+  claude_bin: claude
+  model: claude-haiku-4-5
   max_tokens: 2000
-
-# 推送配置
 notification:
   feishu:
-    # 飞书直推已禁用，后续走 OpenClaw plugin 接入
     enabled: false
-    # Ethan 的飞书 open_id
-    user_open_id: "ou_1fabefc2f9ff4884531cd8ab2949f1b2"
-    # OpenClaw webhook（使用 message 工具推送，此处为占位）
-    webhook_url: ""
-
-# Web Dashboard
+    user_open_id: ou_1fabefc2f9ff4884531cd8ab2949f1b2
+    webhook_url: ''
+  websocket:
+    enabled: true
+  webhooks: []
 web:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8765
   debug: false
-
-# 存储
 storage:
-  db_path: "./data/pulse.db"
-  log_dir: "./logs"
+  db_path: ./data/pulse.db
+  log_dir: ./logs

@@ -372,6 +372,51 @@ def run_pipeline(ctx, push):
     click.echo("\n✅ 完成！")
 
 
+@cli.command("watch")
+@click.option("--follow", "-f", is_flag=True, help="持续监听（默认收到第一个事件后退出）")
+@click.option("--port", "-p", default=None, type=int, help="Web 服务端口（默认从配置读取）")
+@click.pass_context
+def watch(ctx, follow, port):
+    """监听新报告事件（通过 WebSocket）
+
+    连接本地 Pulse Web 服务，等待 report_ready 事件，收到后输出 JSON 并退出。
+    加 --follow 可持续监听。
+    """
+    cfg = _load_cfg(ctx.obj.get("config_path"))
+    ws_port = port or cfg.web.port
+
+    try:
+        from websockets.sync.client import connect
+        from websockets.exceptions import ConnectionClosed
+    except ImportError:
+        click.echo("需要安装 websockets: pip install websockets", err=True)
+        sys.exit(1)
+
+    url = f"ws://localhost:{ws_port}/ws"
+    click.echo(f"连接 {url} ...", err=True)
+
+    try:
+        with connect(url) as ws:
+            click.echo("已连接，等待事件...", err=True)
+            while True:
+                try:
+                    msg = ws.recv(timeout=60)
+                    data = json.loads(msg)
+                    if data.get("type") == "report_ready":
+                        click.echo(json.dumps(data, ensure_ascii=False))
+                        if not follow:
+                            break
+                except TimeoutError:
+                    # 发送 ping 保持连接
+                    ws.send("ping")
+    except ConnectionClosed:
+        click.echo("连接已关闭", err=True)
+        sys.exit(1)
+    except OSError as e:
+        click.echo(f"连接失败: {e}（请确认 pulse web 服务已启动，端口: {ws_port}）", err=True)
+        sys.exit(1)
+
+
 def main():
     cli(obj={})
 
