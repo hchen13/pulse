@@ -173,9 +173,10 @@ def _run_full_cycle():
 
         cfg = load_config(_config_path)
         repos = cfg.enabled_repos
-        # 每个 repo 有 issues/prs/commits/main 共 4 步，加上每个 repo 合成 + 1 个全局合成
-        # 简化为: repos * 4 + (repos > 1 ? 1 : 0)
-        total_steps = len(repos) * 4 + (1 if len(repos) > 1 else 0)
+        # Phase 1: 每个 repo 有 issues/prs/commits/main 共 4 步
+        # Phase 2: 每个 repo 有 synthesis 1 步 + 1 个全局综合
+        # total = repos * 4 + repos + 1 (when repos > 1)
+        total_steps = len(repos) * 4 + (len(repos) + 1 if len(repos) > 1 else 0)
 
         # 初始化步骤状态
         _step_states = {}
@@ -225,25 +226,40 @@ def _run_full_cycle():
             except Exception as e:
                 logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
 
-        logger.info("[run] LLM 分析（并行）")
+        logger.info("[run] Phase 1: 维度分析（并行）")
         from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             future_to_repo = {executor.submit(analyzer.analyze_repo, repo, 7, run_id): repo for repo in repos}
             for future in _as_completed(future_to_repo):
                 repo = future_to_repo[future]
                 try:
-                    analysis = future.result()
-                    if analysis:
-                        repo_reports[repo.display_name] = analysis
+                    ok = future.result()
+                    if ok:
+                        logger.info(f"[run] 维度分析完成: {repo.full_name}")
                 except Exception as e:
                     logger.error(f"[run] 分析失败 {repo.full_name}: {e}")
 
-        if len(repo_reports) > 1:
-            logger.info("[run] 全局综合分析")
-            try:
-                analyzer.analyze_global(repo_reports, run_id=run_id)
-            except Exception as e:
-                logger.error(f"[run] 全局分析失败: {e}")
+        if len(repos) > 1:
+            logger.info("[run] Phase 2: repo 合成 + 全局综合（并行）")
+            with ThreadPoolExecutor(max_workers=len(repos) + 1) as executor:
+                synthesis_futures = {executor.submit(analyzer.analyze_repo_synthesis, repo, run_id): repo for repo in repos}
+                global_future = executor.submit(analyzer.analyze_global, run_id)
+
+                for future in _as_completed(synthesis_futures):
+                    repo = synthesis_futures[future]
+                    try:
+                        synthesis = future.result()
+                        if synthesis:
+                            repo_reports[repo.display_name] = synthesis
+                            logger.info(f"[run] 合成完成: {repo.full_name}")
+                    except Exception as e:
+                        logger.error(f"[run] 合成失败 {repo.full_name}: {e}")
+
+                try:
+                    global_future.result()
+                    logger.info("[run] 全局综合完成")
+                except Exception as e:
+                    logger.error(f"[run] 全局分析失败: {e}")
 
         try:
             analyzer.cleanup_old_data(days=40)
@@ -1956,7 +1972,15 @@ def get_dashboard_html() -> str:
             let stepLabel = step.step_name;
             // Make synthetic label (global synthesis)
             const isGlobal = step.repo_full_name === '__global__';
-            const displayName = isGlobal ? '全局综合' : `${repoDisplay}/${stepLabel}`;
+            const isRepoSynthesis = step.step_name === 'synthesis' && !isGlobal;
+            let displayName;
+            if (isGlobal) {
+                displayName = '全局综合';
+            } else if (isRepoSynthesis) {
+                displayName = `${repoDisplay} 合成`;
+            } else {
+                displayName = `${repoDisplay}/${stepLabel}`;
+            }
 
             const model = fmtModel(step.model);
             const durStr = fmtSeconds(duration);
@@ -2038,20 +2062,26 @@ def get_dashboard_html() -> str:
                     return;
                 }
 
-                // Separate into Phase 1 (dimension steps, non-global) and Phase 2 (global synthesis)
-                const phase1Steps = steps.filter(s => s.repo_full_name !== '__global__');
-                const phase2Steps = steps.filter(s => s.repo_full_name === '__global__');
+                // Separate into Phase 1 (dimension steps) and Phase 2 (synthesis steps, all parallel)
+                const dimStepNames = new Set(['issues', 'prs', 'commits', 'main']);
+                const phase1Steps = steps.filter(s => s.repo_full_name !== '__global__' && dimStepNames.has(s.step_name));
+                // Phase 2: repo synthesis + global synthesis (all run in parallel after Phase 1)
+                const phase2Steps = steps.filter(s => s.step_name === 'synthesis');
 
                 // Phase 1 duration = max step duration (parallel)
                 const phase1MaxDur = phase1Steps.length > 0
                     ? Math.max(...phase1Steps.map(s => s.duration_s || 0))
                     : null;
-                const phase2TotalDur = phase2Steps.reduce((sum, s) => sum + (s.duration_s || 0), 0);
+                // Phase 2 duration = max of all synthesis steps (they run in parallel)
+                const phase2MaxDur = phase2Steps.length > 0
+                    ? Math.max(...phase2Steps.map(s => s.duration_s || 0))
+                    : 0;
+                const phase2TotalDur = phase2MaxDur;
 
-                // Actual total: use elapsed from run status or sum parallel + sequential
+                // Actual total: use elapsed from run status or phase1 + phase2 (both parallel)
                 const actualTotal = isRunning
                     ? (runStatus.elapsed_s || null)
-                    : (phase1MaxDur != null ? phase1MaxDur + phase2TotalDur : null);
+                    : (phase1MaxDur != null ? phase1MaxDur + phase2MaxDur : null);
 
                 // Format date for display
                 const dateStr = date || '—';
@@ -2085,7 +2115,7 @@ def get_dashboard_html() -> str:
                     const phase2Dur = phase2TotalDur ? fmtSeconds(phase2TotalDur) : '';
                     html += `<div class="phase-block">
                         <div class="phase-label">
-                            <span>Phase 2: 综合分析</span>
+                            <span>Phase 2: 项目合成 + 全局综合（并行）</span>
                             ${phase2Dur ? `<span class="phase-duration">${phase2Dur}</span>` : ''}
                         </div>`;
                     phase2Steps.forEach((step, i) => {

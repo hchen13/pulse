@@ -148,26 +148,53 @@ def report(ctx, date, repo, generate, push):
 
     if generate:
         click.echo(f"生成 {date} 的分析报告（并行）...")
-        repo_reports = {}
+
+        # Phase 1: 12 个维度分析并行
+        click.echo("  [Phase 1] 维度分析（并行）...")
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             future_to_repo = {executor.submit(analyzer.analyze_repo, r): r for r in repos}
             for future in as_completed(future_to_repo):
                 r = future_to_repo[future]
                 try:
-                    analysis = future.result()
-                    if analysis:
-                        repo_reports[r.display_name] = analysis
-                        click.echo(f"  ✓ {r.full_name}")
+                    ok = future.result()
+                    if ok:
+                        click.echo(f"  ✓ {r.full_name} 维度分析完成")
                     else:
-                        click.echo(f"  ✗ {r.full_name} 分析失败")
+                        click.echo(f"  ✗ {r.full_name} 维度分析失败")
                 except Exception as e:
                     click.echo(f"  ✗ {r.full_name} 异常: {e}")
 
-        if not repo and len(repo_reports) > 1:
-            click.echo("  生成综合分析...")
-            global_report = analyzer.analyze_global(repo_reports)
-        else:
-            global_report = None
+        # Phase 2: repo 合成 + 全局综合 同时并行（都只依赖 Phase 1）
+        global_report = None
+        repo_reports = {}
+        if not repo:
+            click.echo("  [Phase 2] repo 合成 + 全局综合（并行）...")
+            with ThreadPoolExecutor(max_workers=len(repos) + 1) as executor:
+                # 3 个 repo 合成
+                synthesis_futures = {executor.submit(analyzer.analyze_repo_synthesis, r): r for r in repos}
+                # 1 个全局综合（同时启动）
+                global_future = executor.submit(analyzer.analyze_global)
+
+                for future in as_completed(synthesis_futures):
+                    r = synthesis_futures[future]
+                    try:
+                        synthesis = future.result()
+                        if synthesis:
+                            repo_reports[r.display_name] = synthesis
+                            click.echo(f"  ✓ {r.display_name} 合成完成")
+                        else:
+                            click.echo(f"  ✗ {r.display_name} 合成失败")
+                    except Exception as e:
+                        click.echo(f"  ✗ {r.display_name} 合成异常: {e}")
+
+                try:
+                    global_report = global_future.result()
+                    if global_report:
+                        click.echo("  ✓ 全局综合完成")
+                    else:
+                        click.echo("  ✗ 全局综合失败")
+                except Exception as e:
+                    click.echo(f"  ✗ 全局综合异常: {e}")
 
         if push:
             notifier = FeishuNotifier(cfg.notification)
@@ -339,26 +366,43 @@ def run_pipeline(ctx, push):
         fetch_results[r.full_name] = results
         click.echo(f"  ✓ {results}")
 
-    # 2. 分析（并行）
-    click.echo("\n[2/3] LLM 分析（并行）")
-    repo_reports = {}
+    # 2. Phase 1: 维度分析（并行）
+    click.echo("\n[Phase 1] 维度分析（并行）")
     with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
         future_to_repo = {executor.submit(analyzer.analyze_repo, r): r for r in cfg.enabled_repos}
         for future in as_completed(future_to_repo):
             r = future_to_repo[future]
             try:
-                analysis = future.result()
-                if analysis:
-                    repo_reports[r.display_name] = analysis
+                ok = future.result()
+                if ok:
                     click.echo(f"  ✓ {r.full_name}")
             except Exception as e:
                 click.echo(f"  ✗ {r.full_name} 异常: {e}")
 
+    # Phase 2: repo 合成 + 全局综合（并行）
+    repo_reports = {}
     global_report = None
-    if len(repo_reports) > 1:
-        click.echo("  生成综合分析...")
-        global_report = analyzer.analyze_global(repo_reports)
-        click.echo("  ✓")
+    if len(cfg.enabled_repos) > 1:
+        click.echo("\n[Phase 2] repo 合成 + 全局综合（并行）")
+        with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) + 1) as executor:
+            synthesis_futures = {executor.submit(analyzer.analyze_repo_synthesis, r): r for r in cfg.enabled_repos}
+            global_future = executor.submit(analyzer.analyze_global)
+
+            for future in as_completed(synthesis_futures):
+                r = synthesis_futures[future]
+                try:
+                    synthesis = future.result()
+                    if synthesis:
+                        repo_reports[r.display_name] = synthesis
+                        click.echo(f"  ✓ {r.display_name} 合成")
+                except Exception as e:
+                    click.echo(f"  ✗ {r.display_name} 合成异常: {e}")
+
+            try:
+                global_report = global_future.result()
+                click.echo("  ✓ 全局综合")
+            except Exception as e:
+                click.echo(f"  ✗ 全局综合异常: {e}")
 
     # 3. 推送
     if push:

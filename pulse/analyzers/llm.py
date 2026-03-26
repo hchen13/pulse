@@ -623,30 +623,86 @@ class LLMAnalyzer:
                     logger.error(f"  [error] {key} analysis for {repo.display_name}: {e}")
                     dim_results[key] = None
 
-        issues_analysis = dim_results.get('issues')
-        prs_analysis = dim_results.get('prs')
-        branch_analysis = dim_results.get('branch')
-        main_analysis = dim_results.get('main')
+        dim_results_values = [dim_results.get(k) for k in ['issues', 'prs', 'branch', 'main']]
+        any_success = any(v is not None for v in dim_results_values)
 
-        # 合并四个维度（直接拼接，每个维度已包含标题）
-        sections = [s for s in [issues_analysis, prs_analysis, branch_analysis, main_analysis] if s]
-        analysis = "\n\n".join(sections) if sections else None
+        # 不在这里保存 reports（由 analyze_repo_synthesis 负责合成后保存）
+        # analyze_repo 只负责跑 4 个维度并存入 analysis_steps
+        logger.info(f"  Completed 4-dimension analysis for {repo.full_name}, success={any_success}")
+        return any_success
+
+    def analyze_repo_synthesis(self, repo: "RepoConfig", run_id: str = "") -> Optional[str]:
+        """第二层：对单个 repo 的 4 份维度原始输出做 repo 级合成
+        
+        从 DB 的 analysis_steps 表读取当天该 repo 的 4 份维度报告，合并成 repo 级综合报告。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        step_key = f"{repo.display_name}/synthesis"
+
+        self._broadcast("step_start", {
+            "run_id": run_id,
+            "step": step_key,
+            "analyst": "综合分析师",
+            "repo": repo.display_name,
+        })
+        t0 = time.time()
+
+        # 从 DB 读取当天该 repo 的 4 份维度原始输出
+        with get_db(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT step_name, content
+                FROM analysis_steps
+                WHERE report_date = ? AND repo_full_name = ? AND step_name != 'synthesis'
+                ORDER BY step_name
+            """, (today, repo.full_name)).fetchall()
+
+        if not rows:
+            logger.warning(f"No dimension steps found for {repo.full_name} on {today}")
+            self._broadcast("step_done", {
+                "run_id": run_id,
+                "step": step_key,
+                "duration_s": 0,
+                "success": False,
+            })
+            return None
+
+        # 拼接 4 份维度报告作为 synthesis prompt 的输入
+        dims_text = "\n\n".join(f"{row['content']}" for row in rows)
+
+        synthesis_prompt = f"""以下是 **{repo.display_name}** 今天的四个维度分析报告：
+
+{dims_text}
+
+---
+
+请将上述四个维度的内容整合成一份完整的项目分析报告，保留所有维度的标题和核心洞察，去除冗余表达，输出结构化 Markdown 报告。
+
+【输出规范】不要 emoji，保留四个维度标题，中文输出。
+"""
+
+        analysis = self._call_claude(synthesis_prompt, analyst="synthesis")
+        duration = time.time() - t0
 
         if analysis:
-            today = datetime.now().strftime("%Y-%m-%d")
             with get_db(self.db_path) as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO reports
                     (report_date, repo_full_name, report_type, content)
                     VALUES (?, ?, 'repo', ?)
                 """, (today, repo.full_name, analysis))
-            logger.info(f"  Saved 4-angle report for {repo.full_name}")
+            self._save_step(today, repo.full_name, "synthesis", "synthesis", analysis, duration)
 
+        self._broadcast("step_done", {
+            "run_id": run_id,
+            "step": step_key,
+            "duration_s": round(duration, 1),
+            "success": analysis is not None,
+        })
         return analysis
 
-    def analyze_global(self, repo_summaries: Dict[str, str], run_id: str = "") -> Optional[str]:
-        """生成跨 repo 的四角度综合分析"""
-        logger.info("Generating global 4-angle analysis")
+    def analyze_global(self, run_id: str = "") -> Optional[str]:
+        """第三层：跨 repo 全局综合分析 — 读取当天所有 12 份维度原始输出（不读 repo 合成）"""
+        logger.info("Generating global 4-angle analysis from raw dimension reports")
 
         step_key = "global/synthesis"
         self._broadcast("step_start", {
@@ -656,15 +712,71 @@ class LLMAnalyzer:
         })
         t0 = time.time()
 
-        summaries_text = ""
-        for repo_name, summary in repo_summaries.items():
-            summaries_text += f"\n## {repo_name}\n{summary}\n\n"
-
         today = datetime.now().strftime("%Y-%m-%d")
-        prompt = GLOBAL_SUMMARY_PROMPT.format(
-            date=today,
-            repo_summaries=summaries_text,
-        )
+
+        # 从 DB 读取今天所有维度分析的原始输出（不含 __global__ 和 synthesis）
+        with get_db(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT repo_full_name, step_name, content
+                FROM analysis_steps
+                WHERE report_date = ? AND repo_full_name != '__global__' AND step_name != 'synthesis'
+                ORDER BY repo_full_name, step_name
+            """, (today,)).fetchall()
+
+        if not rows:
+            logger.warning(f"No dimension steps found for {today}, cannot generate global analysis")
+            self._broadcast("step_done", {
+                "run_id": run_id,
+                "step": step_key,
+                "duration_s": 0,
+                "success": False,
+            })
+            return None
+
+        # 写到临时文件（每份报告一个文件），让 Sonnet 按需读取
+        tmp_dir = Path("/tmp/pulse")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        file_list_lines = []
+        for row in rows:
+            safe_repo = row["repo_full_name"].replace("/", "-")
+            filepath = tmp_dir / f"{safe_repo}-{row['step_name']}-{today}.md"
+            filepath.write_text(row["content"] or "", encoding="utf-8")
+            word_count = len((row["content"] or "").split())
+            file_list_lines.append(
+                f"- {row['repo_full_name']} / {row['step_name']} ({word_count} 词): {filepath}"
+            )
+
+        file_list = "\n".join(file_list_lines)
+
+        prompt = f"""以下是今天 {len(rows)} 份维度分析报告的清单（repo名 / 维度 / 词数 / 文件路径）：
+
+{file_list}
+
+请读取这些文件，然后输出跨项目的全局综合分析。
+
+【严格要求】输出不得包含任何 emoji 字符。不得使用表情符号、图标、符号标记（如 🔍📊🎯🚨📈 等）。纯文字 + Markdown 标题 + bullet points 输出。
+
+请输出跨项目综合观察，中文，**直接用以下结构输出，不要加前言或标题前缀**：
+
+## 用户都在头疼什么
+
+多个项目用户共同反映的痛点。哪些抱怨反复出现？这说明现阶段 AI 工具在哪里还没做好？用口语化方式描述。（3-4 条 bullet）
+
+## 社区在往哪发力
+
+社区贡献者在自发解决什么问题？哪些方向上有多个项目的社区同时在推进？这说明什么？（3-4 条 bullet）
+
+## 官方重点做什么
+
+各项目官方团队在把资源押在哪里？有什么共同的方向，有什么明显的分歧？这对行业走向意味着什么？（3-4 条 bullet）
+
+## 值得关注的信号
+
+这期最值得记住的 2-3 个观察。要有立场：不是陈述事实，而是说清楚"这意味着什么，对开发者或用户有什么影响"。（3-4 条 bullet，必须有观点）
+
+【输出规范】禁止 emoji，禁止图标字符，禁止"折射出"、"其本质在于"等学术化表达，禁止重复各项目内容，要用平易近人的语言讲赛道故事。
+"""
 
         analysis = self._call_claude(prompt, analyst="synthesis")
         duration = time.time() - t0

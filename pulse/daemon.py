@@ -57,32 +57,52 @@ class PulseDaemon:
                 logger.error(f"采集 {repo.full_name} 失败: {e}")
                 errors.append(f"采集失败: {repo.full_name} — {e}")
 
-        # 2. LLM 分析（并行）
-        logger.info("LLM 分析（并行）...")
+        # 2. Phase 1: 12 个维度分析并行
+        logger.info("Phase 1: 维度分析（并行）...")
         with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
             future_to_repo = {executor.submit(analyzer.analyze_repo, repo): repo for repo in cfg.enabled_repos}
             for future in as_completed(future_to_repo):
                 repo = future_to_repo[future]
                 try:
-                    analysis = future.result()
-                    if analysis:
-                        repo_reports[repo.display_name] = analysis
-                        logger.info(f"✓ 分析完成: {repo.full_name}")
+                    ok = future.result()
+                    if ok:
+                        logger.info(f"✓ 维度分析完成: {repo.full_name}")
                     else:
-                        logger.warning(f"分析返回空: {repo.full_name}")
+                        logger.warning(f"维度分析返回空: {repo.full_name}")
                 except Exception as e:
                     logger.error(f"分析 {repo.full_name} 失败: {e}")
                     errors.append(f"分析失败: {repo.full_name} — {e}")
 
-        # 3. 生成全局分析
+        # 3. Phase 2: repo 合成 + 全局综合 同时并行（都只依赖 Phase 1）
         global_report = None
-        if len(repo_reports) > 1:
-            logger.info("生成综合分析...")
-            try:
-                global_report = analyzer.analyze_global(repo_reports)
-                logger.info("✓ 综合分析完成")
-            except Exception as e:
-                logger.error(f"综合分析失败: {e}")
+        if len(cfg.enabled_repos) > 1:
+            logger.info("Phase 2: repo 合成 + 全局综合（并行）...")
+            with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) + 1) as executor:
+                synthesis_futures = {executor.submit(analyzer.analyze_repo_synthesis, repo): repo for repo in cfg.enabled_repos}
+                global_future = executor.submit(analyzer.analyze_global)
+
+                for future in as_completed(synthesis_futures):
+                    repo = synthesis_futures[future]
+                    try:
+                        synthesis = future.result()
+                        if synthesis:
+                            repo_reports[repo.display_name] = synthesis
+                            logger.info(f"✓ 合成完成: {repo.full_name}")
+                        else:
+                            logger.warning(f"合成返回空: {repo.full_name}")
+                    except Exception as e:
+                        logger.error(f"合成 {repo.full_name} 失败: {e}")
+                        errors.append(f"合成失败: {repo.full_name} — {e}")
+
+                try:
+                    global_report = global_future.result()
+                    if global_report:
+                        logger.info("✓ 全局综合完成")
+                    else:
+                        logger.warning("全局综合返回空")
+                except Exception as e:
+                    logger.error(f"综合分析失败: {e}")
+                    errors.append(f"综合分析失败: {e}")
 
         # 3.5 清理旧数据（40天滚动）
         try:
