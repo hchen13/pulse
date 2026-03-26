@@ -231,8 +231,16 @@ def _run_full_cycle():
                 tracked_broadcast("step_start", {"step": f"fetch/{repo.full_name}", "run_id": run_id})
                 logger.info(f"[run] 采集 {repo.full_name}")
                 collector.fetch_all(repo)
-                dur = _time.time() - t0
-                tracked_broadcast("step_done", {"step": f"fetch/{repo.full_name}", "run_id": run_id, "duration_s": round(dur, 1)})
+                dur = round(_time.time() - t0, 1)
+                tracked_broadcast("step_done", {"step": f"fetch/{repo.full_name}", "run_id": run_id, "duration_s": dur})
+                # 存 DB
+                today = datetime.now().strftime("%Y-%m-%d")
+                with get_db(cfg.storage.db_path) as conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO analysis_steps
+                        (report_date, repo_full_name, step_name, analyst, model, content, duration_s)
+                        VALUES (?, ?, 'fetch', 'collector', 'gh-cli', ?, ?)
+                    """, (today, repo.full_name, f"采集完成: issues/PRs/commits/releases", dur))
                 return repo.full_name
             fetch_futures = {executor.submit(_fetch_repo, repo): repo for repo in repos}
             for future in _as_completed(fetch_futures):
@@ -2081,8 +2089,11 @@ def get_dashboard_html() -> str:
                 }
 
                 // Separate into phases
-                // Phase 0: fetch steps (from live run status, name starts with "fetch/")
-                const fetchSteps = steps.filter(s => (s.step_name || s.name || '').startsWith('fetch/') && (s.step_name || s.name || '') !== 'fetch/all');
+                // Phase 0: fetch steps (from DB step_name=='fetch' or live 'fetch/*')
+                const fetchSteps = steps.filter(s => {
+                    const sn = s.step_name || s.name || '';
+                    return sn === 'fetch' || (sn.startsWith('fetch/') && sn !== 'fetch/all');
+                });
                 const fetchAllStep = steps.find(s => (s.step_name || s.name || '') === 'fetch/all');
                 // Phase 1: dimension analysis
                 const dimStepNames = new Set(['issues', 'prs', 'commits', 'main']);
