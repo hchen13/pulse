@@ -42,6 +42,7 @@ _run_lock = threading.Lock()
 
 # 运行时步骤跟踪（run_id -> step states）
 _step_states: Dict[str, Dict] = {}  # {step_key: {status, duration_s}}
+_run_cancel: bool = False
 
 # WebSocket 连接列表
 _ws_clients: List[WebSocket] = []
@@ -161,7 +162,7 @@ def notify_webhooks(report_date: str, repos: List[str]):
 
 def _run_full_cycle():
     """后台线程：完整采集+分析流程"""
-    global _run_status, _step_states
+    global _run_status, _step_states, _run_cancel
     import uuid
     run_id = str(uuid.uuid4())[:8]
     start_time = time.time()
@@ -178,12 +179,23 @@ def _run_full_cycle():
         # total = repos * 4 + repos + 1 (when repos > 1)
         total_steps = len(repos) + len(repos) * 4 + len(repos) + 1  # fetch + dims + repo synthesis + global
 
-        # 初始化步骤状态
+        # 预填所有步骤为 pending
         _step_states = {}
+        _run_cancel = False
+        for repo in repos:
+            _step_states[f"fetch/{repo.full_name}"] = {"status": "pending", "duration_s": None}
+            for dim in ["issues", "prs", "commits", "main"]:
+                _step_states[f"{repo.display_name}/{dim}"] = {"status": "pending", "duration_s": None}
+            _step_states[f"{repo.display_name}/synthesis"] = {"status": "pending", "duration_s": None}
+        _step_states["global/synthesis"] = {"status": "pending", "duration_s": None}
+
         with _run_lock:
             _run_status["run_id"] = run_id
             _run_status["total_steps"] = total_steps
-            _run_status["steps"] = []
+            _run_status["steps"] = [
+                {"name": k, "status": v["status"], "duration_s": v["duration_s"]}
+                for k, v in _step_states.items()
+            ]
             _run_status["current_step"] = None
 
         today = datetime.now().strftime("%Y-%m-%d")
@@ -223,6 +235,11 @@ def _run_full_cycle():
         analyzer = LLMAnalyzer(cfg.analysis, cfg.storage.db_path, broadcast_fn=tracked_broadcast)
 
         repo_reports = {}
+        if _run_cancel:
+            _run_status["running"] = False
+            _run_status["error"] = "已取消"
+            return
+
         # 采集并行
         import time as _time
         from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
@@ -256,6 +273,11 @@ def _run_full_cycle():
                     logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
         fetch_dur = _time.time() - fetch_start
         tracked_broadcast("step_done", {"step": "fetch/all", "run_id": run_id, "duration_s": round(fetch_dur, 1)})
+
+        if _run_cancel:
+            _run_status["running"] = False
+            _run_status["error"] = "已取消"
+            return
 
         # 每个 repo 独立流水线：维度分析完成 → 立即合成
         logger.info("[run] 开始分析（每个 repo 独立流水线）")
@@ -606,6 +628,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         t = threading.Thread(target=_run_full_cycle, daemon=True)
         t.start()
         return {"status": "started", "started_at": _run_status["started_at"]}
+
+    @app.post("/api/run/stop")
+    async def stop_run():
+        global _run_cancel
+        with _run_lock:
+            if not _run_status["running"]:
+                return {"status": "not_running"}
+            _run_cancel = True
+        return {"status": "stopping"}
 
     @app.get("/api/run/status")
     async def get_run_status():
@@ -1591,14 +1622,41 @@ def get_dashboard_html() -> str:
 
         async function triggerRun() {
             const btn = document.getElementById('btn-run');
+            // If running, stop it
+            if (btn.dataset.state === 'running') {
+                btn.disabled = true;
+                try {
+                    await fetchJSON('api/run/stop', { method: 'POST' });
+                } catch(e) {}
+                btn.disabled = false;
+                return;
+            }
+            // Start new run
             btn.disabled = true;
             try {
-                await fetchJSON('api/run', { method: 'POST' });
+                const resp = await fetchJSON('api/run', { method: 'POST' });
+                if (resp.status === 'already_running') {
+                    alert('已有分析在运行中');
+                    btn.disabled = false;
+                    return;
+                }
+                btn.textContent = '停止';
+                btn.dataset.state = 'running';
+                btn.style.background = '#f7768e';
+                btn.disabled = false;
                 startRunPolling();
             } catch (e) {
                 alert(`启动失败: ${e.message}`);
                 btn.disabled = false;
             }
+        }
+
+        function resetRunButton() {
+            const btn = document.getElementById('btn-run');
+            btn.textContent = '立即分析';
+            btn.dataset.state = 'idle';
+            btn.style.background = '';
+            btn.disabled = false;
         }
 
         function startRunPolling() {
@@ -1614,7 +1672,7 @@ def get_dashboard_html() -> str:
                         clearInterval(runStatusInterval);
                         runStatusInterval = null;
                         statusbar.style.display = 'none';
-                        document.getElementById('btn-run').disabled = false;
+                        resetRunButton();
                         if (s.result) {
                             await loadOverview();
                             await loadReportDates();
@@ -1939,7 +1997,7 @@ def get_dashboard_html() -> str:
 
         let _wfDate = null;
         let _wfSteps = [];       // from API
-        let _wfLiveStates = {};  // from WS: {step_key: {status, duration_s}}
+        // Simplified: no client-side state. All state from API.
 
         // step_key from WS events is "{repo_display_name}/{step_name}" e.g. "claude-code/issues"
         // step from DB is {repo_full_name, step_name} e.g. "anthropics/claude-code", "issues"
@@ -1984,18 +2042,12 @@ def get_dashboard_html() -> str:
         }
 
         function getStepStatus(step) {
-            const live = getLiveState(step.repo_full_name, step.step_name,
-                _repoDisplayMap[step.repo_full_name] || step.repo_full_name);
-            if (live) return live.status;
             if (step._liveStatus) return step._liveStatus;
             if (step.duration_s != null) return 'done';
             return 'pending';
         }
 
         function getStepDuration(step) {
-            const live = getLiveState(step.repo_full_name, step.step_name,
-                _repoDisplayMap[step.repo_full_name] || step.repo_full_name);
-            if (live && live.duration_s != null) return live.duration_s;
             return step.duration_s;
         }
 
@@ -2076,16 +2128,14 @@ def get_dashboard_html() -> str:
                 let date = null;
                 let totalS = null;
 
-                if (_wfStartTime && Object.keys(_wfLiveStates).length > 0) {
-                    // New run in progress: use _wfLiveStates only, don't read DB
-                    date = new Date().toISOString().slice(0, 10);
-                } else if (isRunning && runStatus.steps && runStatus.steps.length > 0) {
-                    const wfData = await fetchJSON('api/workflow/latest').catch(() => null);
-                    if (wfData && wfData.steps) {
-                        steps = wfData.steps;
-                        date = wfData.date;
+                if (isRunning) {
+                    // Running: read from run status API (includes live step states)
+                    if (runStatus.steps && runStatus.steps.length > 0) {
+                        steps = runStatus.steps;
+                        date = new Date().toISOString().slice(0, 10);
                     }
-                } else {
+                }
+                if (!steps.length) {
                     const wfData = await fetchJSON('api/workflow/latest').catch(() => null);
                     if (wfData && wfData.steps) {
                         steps = wfData.steps;
@@ -2096,36 +2146,6 @@ def get_dashboard_html() -> str:
 
                 _wfDate = date;
                 _wfSteps = steps;
-
-                // If running (or just started) and we have live states, build steps from those
-                if (!steps.length && (_wfStartTime || isRunning) && Object.keys(_wfLiveStates).length > 0) {
-                    steps = Object.entries(_wfLiveStates).map(([key, state]) => {
-                        const parts = key.split('/');
-                        let repo_full_name, step_name;
-                        if (key === 'global/synthesis') {
-                            repo_full_name = '__global__';
-                            step_name = 'synthesis';
-                        } else if (key.startsWith('fetch/')) {
-                            repo_full_name = key.replace('fetch/', '');
-                            step_name = 'fetch';
-                        } else if (parts.length >= 2) {
-                            step_name = parts.pop();
-                            repo_full_name = parts.join('/');
-                        } else {
-                            repo_full_name = key;
-                            step_name = 'unknown';
-                        }
-                        return {
-                            repo_full_name,
-                            step_name,
-                            duration_s: state.duration_s,
-                            created_at: null,
-                            model: step_name === 'fetch' ? '—' : (step_name === 'synthesis' ? 'sonnet' : 'haiku'),
-                            _liveStatus: state.status,
-                        };
-                    });
-                    date = new Date().toISOString().slice(0, 10);
-                }
 
                 if (!steps.length) {
                     wrap.innerHTML = `<div class="workflow-container"><div class="loading" style="color:#565f89;">暂无分析数据，点击「立即分析」开始</div></div>`;
@@ -2245,43 +2265,12 @@ def get_dashboard_html() -> str:
         // WS event handlers for live workflow update
         let _wfStartTime = null;
         function handleWorkflowEvent(eventType, data) {
-            if (eventType === 'workflow_start') {
-                _wfLiveStates = {};
-                _wfStartTime = new Date();
-                // Render all expected steps in pending (gray) state
-                // Ensure repos data is loaded (sync fetch if needed)
-                if (!repos || repos.length === 0) {
-                    try {
-                        const xhr = new XMLHttpRequest();
-                        xhr.open('GET', `${_basePath}/api/stats`, false);
-                        xhr.send();
-                        if (xhr.status === 200) repos = JSON.parse(xhr.responseText);
-                    } catch(e) {}
-                }
-                // Server broadcasts use display_name for analysis steps, full_name for fetch
-                for (const r of repos) {
-                    _wfLiveStates[`fetch/${r.full_name}`] = { status: 'pending', duration_s: null };
-                    const dn = r.display_name;
-                    for (const dim of ['issues', 'prs', 'commits', 'main']) {
-                        _wfLiveStates[`${dn}/${dim}`] = { status: 'pending', duration_s: null };
-                    }
-                    _wfLiveStates[`${dn}/synthesis`] = { status: 'pending', duration_s: null };
-                }
-                _wfLiveStates['global/synthesis'] = { status: 'pending', duration_s: null };
-                loadWorkflowTimeline(true);
-                return;
-            } else if (eventType === 'step_start') {
-                const stepKey = data.step || '';
-                _wfLiveStates[stepKey] = { status: 'running', duration_s: null };
-                loadWorkflowTimeline(true);
-            } else if (eventType === 'step_done') {
-                const stepKey = data.step || '';
-                _wfLiveStates[stepKey] = { status: 'done', duration_s: data.duration_s };
-                loadWorkflowTimeline(true);
-            } else if (eventType === 'report_ready') {
-                _wfLiveStates = {};
-                _wfStartTime = null;
-                loadWorkflowTimeline(false);
+            // Simple: any workflow event → just refresh from API
+            loadWorkflowTimeline(eventType !== 'report_ready');
+            if (eventType === 'report_ready') {
+                loadOverview().catch(() => {});
+                loadTodayInsight().catch(() => {});
+                loadReportDates();
             }
         }
 
