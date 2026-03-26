@@ -2251,14 +2251,14 @@ def get_dashboard_html() -> str:
                 _wfLiveStates = {};
                 _wfStartTime = new Date();
                 // Render all expected steps in pending (gray) state
-                const repoNames = repos.map(r => r.full_name);
-                // Pre-populate all expected steps as pending
-                for (const repo of repoNames) {
-                    _wfLiveStates[`fetch/${repo}`] = { status: 'pending', duration_s: null };
+                // Server broadcasts use display_name for analysis steps, full_name for fetch
+                for (const r of repos) {
+                    _wfLiveStates[`fetch/${r.full_name}`] = { status: 'pending', duration_s: null };
+                    const dn = r.display_name;
                     for (const dim of ['issues', 'prs', 'commits', 'main']) {
-                        _wfLiveStates[`${repo}/${dim}`] = { status: 'pending', duration_s: null };
+                        _wfLiveStates[`${dn}/${dim}`] = { status: 'pending', duration_s: null };
                     }
-                    _wfLiveStates[`${repo}/synthesis`] = { status: 'pending', duration_s: null };
+                    _wfLiveStates[`${dn}/synthesis`] = { status: 'pending', duration_s: null };
                 }
                 _wfLiveStates['global/synthesis'] = { status: 'pending', duration_s: null };
                 loadWorkflowTimeline(true);
