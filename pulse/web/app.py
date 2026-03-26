@@ -42,6 +42,10 @@ class UpdateRepoRequest(BaseModel):
     enabled: Optional[bool] = None
 
 
+class UpdateAgentRequest(BaseModel):
+    content: str
+
+
 def _parse_github_url(url: str) -> Optional[tuple]:
     """解析 GitHub URL，返回 (owner, name) 或 None"""
     url = url.strip().rstrip("/")
@@ -227,6 +231,45 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         cfg.repos = new_repos
         _save_repos_to_config(cfg.repos)
         return {"deleted": full_name}
+
+    # ── Agents 管理 API ───────────────────────────────────────────────────────────
+
+    AGENTS_REGISTRY = [
+        {
+            "id": "analyst",
+            "name": "分析师",
+            "file": ".claude/CLAUDE.md",
+        }
+    ]
+
+    @app.get("/api/agents")
+    async def get_agents():
+        result = []
+        project_root = Path(__file__).parent.parent.parent
+        for agent in AGENTS_REGISTRY:
+            file_path = project_root / agent["file"]
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                content = ""
+            result.append({
+                "id": agent["id"],
+                "name": agent["name"],
+                "file": agent["file"],
+                "content": content,
+            })
+        return result
+
+    @app.put("/api/agents/{agent_id}")
+    async def update_agent(agent_id: str, req: UpdateAgentRequest):
+        project_root = Path(__file__).parent.parent.parent
+        agent = next((a for a in AGENTS_REGISTRY if a["id"] == agent_id), None)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+        file_path = project_root / agent["file"]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(req.content, encoding="utf-8")
+        return {"id": agent_id, "name": agent["name"], "file": agent["file"], "content": req.content}
 
     # ── 立即执行 API ─────────────────────────────────────────────────────────────
 
@@ -644,6 +687,24 @@ def get_dashboard_html() -> str:
         .loading { text-align: center; padding: 48px; color: #565f89; font-size: 13px; }
         .error-msg { color: #f7768e; padding: 10px 14px; background: rgba(247,118,142,0.08); border-radius: 6px; font-size: 13px; }
 
+        /* ── Agent cards ── */
+        .agent-card { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
+        .agent-card-header {
+            padding: 14px 18px; border-bottom: 1px solid #2a2d3e;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .agent-card-header h2 { font-size: 15px; color: #e0e2f0; font-weight: 600; }
+        .agent-card-body { padding: 20px 24px; }
+        .agent-card-actions { display: flex; gap: 8px; }
+        .agent-textarea {
+            width: 100%; min-height: 400px; background: #1e2030;
+            color: #c0caf5; border: 1px solid #2a2d3e; border-radius: 6px;
+            font-family: 'SFMono-Regular', 'JetBrains Mono', Consolas, monospace;
+            font-size: 13px; padding: 14px 16px; resize: vertical; outline: none;
+            line-height: 1.6;
+        }
+        .agent-textarea:focus { border-color: #7aa2f7; }
+
         /* ── Modal ── */
         .modal-overlay {
             display: none; position: fixed; inset: 0;
@@ -693,6 +754,7 @@ def get_dashboard_html() -> str:
             <div class="tab active" onclick="switchTab('overview')">概览</div>
             <div class="tab" onclick="switchTab('reports')">日报</div>
             <div class="tab" onclick="switchTab('trends')">趋势</div>
+            <div class="tab" onclick="switchTab('agents')">Agents</div>
         </div>
 
         <!-- 概览 -->
@@ -723,6 +785,11 @@ def get_dashboard_html() -> str:
         <!-- 趋势 -->
         <div id="tab-trends" class="tab-content">
             <div id="trends-content" class="loading">加载中...</div>
+        </div>
+
+        <!-- Agents -->
+        <div id="tab-agents" class="tab-content">
+            <div id="agents-content" class="loading">加载中...</div>
         </div>
 
     </div>
@@ -772,10 +839,11 @@ def get_dashboard_html() -> str:
         }
 
         function switchTab(name) {
-            const names = ['overview', 'reports', 'trends'];
+            const names = ['overview', 'reports', 'trends', 'agents'];
             document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', names[i] === name));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById(`tab-${name}`).classList.add('active');
+            if (name === 'agents') loadAgents();
         }
 
         // ── Repo 管理 ──────────────────────────────────────────────────────────────
@@ -1215,6 +1283,104 @@ def get_dashboard_html() -> str:
 
             } catch (e) {
                 document.getElementById('trends-content').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        // ── Agents ─────────────────────────────────────────────────────────────────
+
+        let _agentsData = [];
+
+        async function loadAgents() {
+            try {
+                const agents = await fetchJSON('api/agents');
+                _agentsData = agents;
+                renderAgents();
+            } catch (e) {
+                document.getElementById('agents-content').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        function renderAgents() {
+            if (!_agentsData.length) {
+                document.getElementById('agents-content').innerHTML = '<div class="loading" style="color:#565f89;">暂无 Agent 配置</div>';
+                return;
+            }
+            let html = '';
+            _agentsData.forEach(agent => {
+                html += `<div class="agent-card" id="agent-card-${agent.id}">
+                    <div class="agent-card-header">
+                        <h2>${escapeHtml(agent.name)}</h2>
+                        <div class="agent-card-actions" id="agent-actions-${agent.id}">
+                            <button class="btn btn-primary btn-sm" onclick="editAgent('${agent.id}')">编辑</button>
+                        </div>
+                    </div>
+                    <div class="agent-card-body">
+                        <div id="agent-view-${agent.id}" class="md-content">${marked.parse(agent.content || '')}</div>
+                        <textarea id="agent-textarea-${agent.id}" class="agent-textarea" style="display:none;">${escapeHtml(agent.content || '')}</textarea>
+                    </div>
+                </div>`;
+            });
+            document.getElementById('agents-content').innerHTML = html;
+        }
+
+        function editAgent(agentId) {
+            const viewEl = document.getElementById(`agent-view-${agentId}`);
+            const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
+            const actionsEl = document.getElementById(`agent-actions-${agentId}`);
+
+            viewEl.style.display = 'none';
+            textareaEl.style.display = 'block';
+
+            actionsEl.innerHTML = `
+                <button class="btn btn-success btn-sm" onclick="saveAgent('${agentId}')">保存</button>
+                <button class="btn btn-sm" style="background:#1e1e2e; color:#565f89; border-color:#2a2d3e;" onclick="cancelEditAgent('${agentId}')">取消</button>
+            `;
+        }
+
+        function cancelEditAgent(agentId) {
+            const agent = _agentsData.find(a => a.id === agentId);
+            if (!agent) return;
+
+            const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
+            textareaEl.value = agent.content || '';
+            textareaEl.style.display = 'none';
+
+            const viewEl = document.getElementById(`agent-view-${agentId}`);
+            viewEl.style.display = 'block';
+
+            const actionsEl = document.getElementById(`agent-actions-${agentId}`);
+            actionsEl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="editAgent('${agentId}')">编辑</button>`;
+        }
+
+        async function saveAgent(agentId) {
+            const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
+            const newContent = textareaEl.value;
+
+            const saveBtn = document.querySelector(`#agent-actions-${agentId} .btn-success`);
+            if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中...'; }
+
+            try {
+                await fetchJSON(`api/agents/${agentId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: newContent }),
+                });
+
+                // 更新本地缓存
+                const agent = _agentsData.find(a => a.id === agentId);
+                if (agent) agent.content = newContent;
+
+                // 切回渲染模式
+                textareaEl.style.display = 'none';
+                const viewEl = document.getElementById(`agent-view-${agentId}`);
+                viewEl.innerHTML = marked.parse(newContent);
+                viewEl.style.display = 'block';
+
+                const actionsEl = document.getElementById(`agent-actions-${agentId}`);
+                actionsEl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="editAgent('${agentId}')">编辑</button>`;
+            } catch (e) {
+                if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
+                alert(`保存失败: ${e.message}`);
             }
         }
 
