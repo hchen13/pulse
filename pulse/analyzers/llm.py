@@ -3,6 +3,7 @@ import subprocess
 import logging
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -13,13 +14,16 @@ from ..db.models import get_db
 logger = logging.getLogger(__name__)
 
 
-# 系统提示：从 .claude/CLAUDE.md 读取分析师身份定义
-_SYSTEM_PROMPT_PATH = Path(__file__).parent.parent.parent / ".claude" / "CLAUDE.md"
+# 分析师 system prompt 目录
+_ANALYSTS_DIR = Path(__file__).parent.parent.parent / ".claude" / "analysts"
 
-def _load_system_prompt() -> str:
-    """读取分析师系统提示"""
-    if _SYSTEM_PROMPT_PATH.exists():
-        return _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+def _load_analyst_prompt(analyst: str) -> str:
+    """读取指定分析师的 system prompt
+    analyst: "issues" | "prs" | "commits" | "synthesis"
+    """
+    path = _ANALYSTS_DIR / f"{analyst}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
     return ""
 
 
@@ -157,10 +161,12 @@ class LLMAnalyzer:
         self.config = config
         self.db_path = db_path
 
-    def _call_claude(self, prompt: str) -> Optional[str]:
-        """调用 claude CLI 进行分析（支持工具调用，允许读取临时文件）"""
+    def _call_claude(self, prompt: str, analyst: str = "synthesis") -> Optional[str]:
+        """调用 claude CLI 进行分析（支持工具调用，允许读取临时文件）
+        analyst: "issues" | "prs" | "commits" | "synthesis"
+        """
         try:
-            system_prompt = _load_system_prompt()
+            system_prompt = _load_analyst_prompt(analyst)
             cmd = [
                 self.config.claude_bin,
                 "--model", self.config.model,
@@ -242,13 +248,24 @@ class LLMAnalyzer:
                 ORDER BY updated_at DESC
             """, (repo_full_name, window_label)).fetchall()
 
-            # PRs — 全量
-            all_prs = conn.execute("""
+            # Open PRs — 社区贡献（PRs 分析师用）
+            all_open_prs = conn.execute("""
                 SELECT pr_number, title, state, author, base_branch, head_branch, created_at, merged_at, url
                 FROM pull_requests
                 WHERE repo_full_name = ?
+                  AND state = 'OPEN'
                   AND fetched_at >= datetime('now', ?)
                 ORDER BY updated_at DESC
+            """, (repo_full_name, window_label)).fetchall()
+
+            # Merged PRs — 官方优先级（Commits 分析师用）
+            all_merged_prs = conn.execute("""
+                SELECT pr_number, title, state, author, base_branch, head_branch, created_at, merged_at, url
+                FROM pull_requests
+                WHERE repo_full_name = ?
+                  AND merged_at IS NOT NULL
+                  AND fetched_at >= datetime('now', ?)
+                ORDER BY merged_at DESC
             """, (repo_full_name, window_label)).fetchall()
 
             # Main 分支 commits
@@ -282,14 +299,16 @@ class LLMAnalyzer:
             """, (repo_full_name, since, window_label)).fetchall()
 
         issues_list = [dict(r) for r in all_issues]
-        prs_list = [dict(r) for r in all_prs]
+        open_prs_list = [dict(r) for r in all_open_prs]
+        merged_prs_list = [dict(r) for r in all_merged_prs]
         main_commits_list = [dict(r) for r in all_main_commits]
         branch_commits_list = [dict(r) for r in all_branch_commits]
         releases_list = [dict(r) for r in all_releases]
 
         # 写全量数据到临时文件
         issues_file = self._write_tmp_file(repo_full_name, "issues", issues_list)
-        prs_file = self._write_tmp_file(repo_full_name, "prs", prs_list)
+        open_prs_file = self._write_tmp_file(repo_full_name, "open_prs", open_prs_list)
+        merged_prs_file = self._write_tmp_file(repo_full_name, "merged_prs", merged_prs_list)
         main_commits_file = self._write_tmp_file(repo_full_name, "main_commits", main_commits_list)
         branch_commits_file = self._write_tmp_file(repo_full_name, "branch_commits", branch_commits_list)
 
@@ -297,8 +316,10 @@ class LLMAnalyzer:
             "window_days": window_days,
             "issues": issues_list,
             "issues_file": issues_file,
-            "prs": prs_list,
-            "prs_file": prs_file,
+            "open_prs": open_prs_list,
+            "open_prs_file": open_prs_file,
+            "merged_prs": merged_prs_list,
+            "merged_prs_file": merged_prs_file,
             "main_commits": main_commits_list,
             "main_commits_file": main_commits_file,
             "branch_commits": branch_commits_list,
@@ -381,21 +402,21 @@ class LLMAnalyzer:
             issue_count=len(issues),
             issues_text=issues_section,
         )
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, analyst="issues")
 
     def _analyze_prs(self, repo_name: str, data: Dict, days: int) -> Optional[str]:
-        """维度 2：社区在解决什么（PRs）"""
-        prs = data["prs"]
+        """维度 2：社区在解决什么（Open PRs only）"""
+        open_prs = data["open_prs"]
         prs_section = self._build_data_section(
-            prs, self._format_prs, data["prs_file"]
+            open_prs, self._format_prs, data["open_prs_file"]
         )
         prompt = PRS_PROMPT.format(
             repo_name=repo_name,
             days=days,
-            pr_count=len(prs),
+            pr_count=len(open_prs),
             prs_text=prs_section,
         )
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, analyst="prs")
 
     def _analyze_branch_commits(
         self,
@@ -404,11 +425,10 @@ class LLMAnalyzer:
         days: int,
     ) -> Optional[str]:
         """维度 3：官方工作重心与方向（merged PRs + 非 main 分支 commits）"""
-        prs = data["prs"]
+        merged_prs = data["merged_prs"]
         branch_commits = data["branch_commits"]
-        merged_prs = [p for p in prs if p.get("merged_at")]
         merged_prs_section = self._build_data_section(
-            merged_prs, self._format_prs, data["prs_file"]
+            merged_prs, self._format_prs, data["merged_prs_file"]
         )
         branch_commits_section = self._build_data_section(
             branch_commits, self._format_commits, data["branch_commits_file"]
@@ -421,7 +441,7 @@ class LLMAnalyzer:
             branch_commit_count=len(branch_commits),
             branch_commits_text=branch_commits_section,
         )
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, analyst="commits")
 
     def _analyze_main_progress(
         self,
@@ -443,7 +463,7 @@ class LLMAnalyzer:
             release_count=len(releases),
             releases_text=self._format_releases(releases),
         )
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, analyst="commits")
 
     def analyze_repo(self, repo: RepoConfig, days: int = 7) -> Optional[str]:
         """分析单个 repo：4个维度分析，返回四角度结构 Markdown 报告"""
@@ -451,27 +471,29 @@ class LLMAnalyzer:
         data = self._get_recent_data(repo.full_name, days)
         effective_days = data["window_days"]
 
-        # 维度 1：用户痛点与需求
-        logger.info(f"  [1/4] Issues analysis ({len(data['issues'])} issues, {effective_days}d window)...")
-        issues_analysis = self._analyze_issues(repo.display_name, data, effective_days)
+        # 4 个维度并行分析
+        logger.info(f"  [parallel] Starting 4-dimension analysis for {repo.display_name} ({effective_days}d window)...")
+        dim_results = {}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._analyze_issues, repo.display_name, data, effective_days): 'issues',
+                executor.submit(self._analyze_prs, repo.display_name, data, effective_days): 'prs',
+                executor.submit(self._analyze_branch_commits, repo.display_name, data, effective_days): 'branch',
+                executor.submit(self._analyze_main_progress, repo.display_name, data, effective_days): 'main',
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    dim_results[key] = future.result()
+                    logger.info(f"  [done] {key} analysis for {repo.display_name}")
+                except Exception as e:
+                    logger.error(f"  [error] {key} analysis for {repo.display_name}: {e}")
+                    dim_results[key] = None
 
-        # 维度 2：社区在解决什么
-        logger.info(f"  [2/4] PRs analysis ({len(data['prs'])} PRs)...")
-        prs_analysis = self._analyze_prs(repo.display_name, data, effective_days)
-
-        # 维度 3：官方工作重心与方向
-        merged_count = sum(1 for p in data["prs"] if p.get("merged_at"))
-        branch_count = len(data["branch_commits"])
-        logger.info(f"  [3/4] Branch commits analysis ({merged_count} merged PRs, {branch_count} branch commits)...")
-        branch_analysis = self._analyze_branch_commits(
-            repo.display_name, data, effective_days
-        )
-
-        # 维度 4：版本进度与节奏
-        logger.info(f"  [4/4] Main progress analysis ({len(data['main_commits'])} main commits, {len(data['releases'])} releases)...")
-        main_analysis = self._analyze_main_progress(
-            repo.display_name, data, effective_days
-        )
+        issues_analysis = dim_results.get('issues')
+        prs_analysis = dim_results.get('prs')
+        branch_analysis = dim_results.get('branch')
+        main_analysis = dim_results.get('main')
 
         # 合并四个维度（直接拼接，每个维度已包含标题）
         sections = [s for s in [issues_analysis, prs_analysis, branch_analysis, main_analysis] if s]
@@ -503,7 +525,7 @@ class LLMAnalyzer:
             repo_summaries=summaries_text,
         )
 
-        analysis = self._call_claude(prompt)
+        analysis = self._call_claude(prompt, analyst="synthesis")
         if analysis:
             with get_db(self.db_path) as conn:
                 conn.execute("""

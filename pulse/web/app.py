@@ -103,14 +103,18 @@ def _run_full_cycle():
             except Exception as e:
                 logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
 
-        for repo in cfg.enabled_repos:
-            logger.info(f"[run] 分析 {repo.full_name}")
-            try:
-                analysis = analyzer.analyze_repo(repo)
-                if analysis:
-                    repo_reports[repo.display_name] = analysis
-            except Exception as e:
-                logger.error(f"[run] 分析失败 {repo.full_name}: {e}")
+        logger.info("[run] LLM 分析（并行）")
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
+            future_to_repo = {executor.submit(analyzer.analyze_repo, repo): repo for repo in cfg.enabled_repos}
+            for future in _as_completed(future_to_repo):
+                repo = future_to_repo[future]
+                try:
+                    analysis = future.result()
+                    if analysis:
+                        repo_reports[repo.display_name] = analysis
+                except Exception as e:
+                    logger.error(f"[run] 分析失败 {repo.full_name}: {e}")
 
         if len(repo_reports) > 1:
             logger.info("[run] 全局综合分析")
@@ -234,42 +238,53 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
     # ── Agents 管理 API ───────────────────────────────────────────────────────────
 
-    AGENTS_REGISTRY = [
-        {
-            "id": "analyst",
-            "name": "分析师",
-            "file": ".claude/CLAUDE.md",
-        }
-    ]
+    # 分析师名称映射
+    _ANALYST_NAMES = {
+        "issues": "Issues 分析师",
+        "prs": "PRs 分析师",
+        "commits": "Commits 分析师",
+        "synthesis": "综合分析师",
+    }
 
     @app.get("/api/agents")
     async def get_agents():
         result = []
         project_root = Path(__file__).parent.parent.parent
-        for agent in AGENTS_REGISTRY:
-            file_path = project_root / agent["file"]
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                content = ""
-            result.append({
-                "id": agent["id"],
-                "name": agent["name"],
-                "file": agent["file"],
-                "content": content,
-            })
+        analysts_dir = project_root / ".claude" / "analysts"
+        if analysts_dir.exists():
+            # 按固定顺序排列
+            order = ["issues", "prs", "commits", "synthesis"]
+            md_files = {f.stem: f for f in analysts_dir.glob("*.md")}
+            # 先按 order 排，再加上不在 order 里的文件（字母序）
+            sorted_stems = [s for s in order if s in md_files] + \
+                           sorted(s for s in md_files if s not in order)
+            for stem in sorted_stems:
+                file_path = md_files[stem]
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                except Exception:
+                    content = ""
+                result.append({
+                    "id": stem,
+                    "name": _ANALYST_NAMES.get(stem, stem),
+                    "file": f".claude/analysts/{file_path.name}",
+                    "content": content,
+                })
         return result
 
     @app.put("/api/agents/{agent_id}")
     async def update_agent(agent_id: str, req: UpdateAgentRequest):
         project_root = Path(__file__).parent.parent.parent
-        agent = next((a for a in AGENTS_REGISTRY if a["id"] == agent_id), None)
-        if not agent:
+        # 安全检查：只允许字母数字和下划线/连字符
+        import re as _re
+        if not _re.match(r'^[\w\-]+$', agent_id):
+            raise HTTPException(status_code=400, detail="Invalid agent id")
+        file_path = project_root / ".claude" / "analysts" / f"{agent_id}.md"
+        if not file_path.exists():
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-        file_path = project_root / agent["file"]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(req.content, encoding="utf-8")
-        return {"id": agent_id, "name": agent["name"], "file": agent["file"], "content": req.content}
+        name = _ANALYST_NAMES.get(agent_id, agent_id)
+        return {"id": agent_id, "name": name, "file": f".claude/analysts/{agent_id}.md", "content": req.content}
 
     # ── 立即执行 API ─────────────────────────────────────────────────────────────
 
@@ -326,6 +341,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     (r.full_name,)
                 ).fetchone()["c"]
 
+                merged_prs_7d = conn.execute(
+                    "SELECT COUNT(*) as c FROM pull_requests WHERE repo_full_name=? AND merged_at IS NOT NULL AND merged_at >= datetime('now', '-7 days')",
+                    (r.full_name,)
+                ).fetchone()["c"]
+
                 latest_release = conn.execute(
                     "SELECT tag_name, published_at FROM releases WHERE repo_full_name=? ORDER BY published_at DESC LIMIT 1",
                     (r.full_name,)
@@ -342,6 +362,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     "issues_open": issues_open,
                     "issues_total": issues_total,
                     "prs_open": prs_open,
+                    "merged_prs_7d": merged_prs_7d,
                     "commits_7d": commits_7d,
                     "latest_release": dict(latest_release) if latest_release else None,
                     "last_fetch": last_fetch,
@@ -485,10 +506,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     GROUP BY day ORDER BY day
                 """, (r.full_name, f"-{days} days")).fetchall()
 
-                daily_prs = conn.execute("""
+                daily_open_prs = conn.execute("""
                     SELECT date(created_at) as day, COUNT(*) as cnt
                     FROM pull_requests
                     WHERE repo_full_name=? AND created_at >= date('now', ?)
+                      AND state = 'OPEN'
+                    GROUP BY day ORDER BY day
+                """, (r.full_name, f"-{days} days")).fetchall()
+
+                daily_merged_prs = conn.execute("""
+                    SELECT date(merged_at) as day, COUNT(*) as cnt
+                    FROM pull_requests
+                    WHERE repo_full_name=? AND merged_at >= date('now', ?)
+                      AND merged_at IS NOT NULL
                     GROUP BY day ORDER BY day
                 """, (r.full_name, f"-{days} days")).fetchall()
 
@@ -498,7 +528,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     "main_commits": [{"day": row["day"], "count": row["cnt"]} for row in daily_main_commits],
                     "branch_commits": [{"day": row["day"], "count": row["cnt"]} for row in daily_branch_commits],
                     "issues": [{"day": row["day"], "count": row["cnt"]} for row in daily_issues],
-                    "prs": [{"day": row["day"], "count": row["cnt"]} for row in daily_prs],
+                    "open_prs": [{"day": row["day"], "count": row["cnt"]} for row in daily_open_prs],
+                    "merged_prs": [{"day": row["day"], "count": row["cnt"]} for row in daily_merged_prs],
                 }
         return result
 
@@ -621,6 +652,8 @@ def get_dashboard_html() -> str:
 
         /* ── Repo cards ── */
         .repo-card { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
+        .repo-card .delete-btn { opacity: 0; transition: opacity 0.2s; }
+        .repo-card:hover .delete-btn { opacity: 1; }
         .repo-header {
             padding: 14px 18px; border-bottom: 1px solid #2a2d3e;
             display: flex; justify-content: space-between; align-items: center;
@@ -687,6 +720,17 @@ def get_dashboard_html() -> str:
         .loading { text-align: center; padding: 48px; color: #565f89; font-size: 13px; }
         .error-msg { color: #f7768e; padding: 10px 14px; background: rgba(247,118,142,0.08); border-radius: 6px; font-size: 13px; }
 
+        /* ── PR toggle ── */
+        .pr-toggle-group { display: flex; gap: 0; border: 1px solid #2a2d3e; border-radius: 6px; overflow: hidden; }
+        .pr-toggle-btn {
+            background: transparent; color: #565f89; border: none; padding: 4px 12px;
+            font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s;
+            border-right: 1px solid #2a2d3e;
+        }
+        .pr-toggle-btn:last-child { border-right: none; }
+        .pr-toggle-btn:hover { background: #1e1e2e; color: #a9b1d6; }
+        .pr-toggle-btn.active { background: #2a2d3e; color: #7aa2f7; font-weight: 600; }
+
         /* ── Agent cards ── */
         .agent-card { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
         .agent-card-header {
@@ -735,11 +779,10 @@ def get_dashboard_html() -> str:
             <span class="pulse-dot"></span>
             <div>
                 <h1>Pulse</h1>
-                <div class="subtitle">AI Harness 竞品情报系统</div>
+                <div class="subtitle">持续感知 AI agent 工具生态的前沿动态</div>
             </div>
         </div>
         <div class="header-actions">
-            <button class="btn btn-success" onclick="openAddRepoModal()">+ 添加项目</button>
             <button class="btn btn-primary" id="btn-run" onclick="triggerRun()">立即分析</button>
         </div>
     </header>
@@ -956,9 +999,10 @@ def get_dashboard_html() -> str:
                 repos = stats;
                 const totalIssues = stats.reduce((s, r) => s + r.issues_open, 0);
                 const totalPRs = stats.reduce((s, r) => s + r.prs_open, 0);
+                const totalMerged = stats.reduce((s, r) => s + (r.merged_prs_7d || 0), 0);
                 const totalCommits = stats.reduce((s, r) => s + r.commits_7d, 0);
 
-                let html = `<div class="grid-3">
+                let html = `<div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:14px; margin-bottom:22px;">
                     <div class="card">
                         <h3>Open Issues</h3>
                         <div class="stat-big">${totalIssues}</div>
@@ -970,10 +1014,21 @@ def get_dashboard_html() -> str:
                         <div class="stat-sub">待合并</div>
                     </div>
                     <div class="card">
+                        <h3>Merged PRs</h3>
+                        <div class="stat-big">${totalMerged}</div>
+                        <div class="stat-sub">近 7 天已合并</div>
+                    </div>
+                    <div class="card">
                         <h3>7日 Commits</h3>
                         <div class="stat-big">${totalCommits}</div>
                         <div class="stat-sub">近 7 天活跃度</div>
                     </div>
+                </div>`;
+
+                // 项目列表标题行（含添加按钮）
+                html += `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <div class="section-title" style="margin:0;">监控项目</div>
+                    <button class="btn btn-success btn-sm" onclick="openAddRepoModal()">+ 添加项目</button>
                 </div>`;
 
                 for (const r of stats) {
@@ -981,7 +1036,6 @@ def get_dashboard_html() -> str:
                     const release = r.latest_release
                         ? `${r.latest_release.tag_name} <span style="color:#565f89;">(${(r.latest_release.published_at || '').substring(0, 10)})</span>`
                         : '<span style="color:#565f89;">-</span>';
-                    const safeName = r.full_name.replace(/\//g, '-');
                     html += `<div class="repo-card">
                         <div class="repo-header">
                             <div class="repo-header-left">
@@ -989,7 +1043,7 @@ def get_dashboard_html() -> str:
                                 <a href="https://github.com/${r.full_name}" target="_blank">${r.full_name} ↗</a>
                             </div>
                             <div class="repo-header-right">
-                                <button class="btn btn-danger btn-sm" onclick="deleteRepo('${r.full_name}')">删除</button>
+                                <button class="btn btn-danger btn-sm delete-btn" onclick="deleteRepo('${r.full_name}')">删除</button>
                             </div>
                         </div>
                         <div class="repo-stats">
@@ -1000,6 +1054,10 @@ def get_dashboard_html() -> str:
                             <div class="repo-stat">
                                 <div class="num">${r.prs_open}</div>
                                 <div class="label">Open PRs</div>
+                            </div>
+                            <div class="repo-stat">
+                                <div class="num">${r.merged_prs_7d || 0}</div>
+                                <div class="label">Merged PRs</div>
                             </div>
                             <div class="repo-stat">
                                 <div class="num">${r.commits_7d}</div>
@@ -1057,14 +1115,9 @@ def get_dashboard_html() -> str:
 
                 const latestDate = dates[0];
                 const global = await fetchJSON(`api/report/${latestDate}`);
-                let preview = global.content;
-                if (preview.length > 800) {
-                    const cutIdx = preview.lastIndexOf('\n', 800);
-                    preview = cutIdx > 200 ? preview.substring(0, cutIdx) + '\n\n...' : preview.substring(0, 800) + '...';
-                }
 
                 document.getElementById('insight-date').textContent = latestDate;
-                document.getElementById('insight-content').innerHTML = marked.parse(preview);
+                document.getElementById('insight-content').innerHTML = marked.parse(global.content || '');
                 document.getElementById('today-insight').style.display = 'block';
             } catch (e) { /* 无报告时静默 */ }
         }
@@ -1241,49 +1294,116 @@ def get_dashboard_html() -> str:
                     return;
                 }
 
-                // 三张图：Commits趋势 / Issues趋势 / PRs趋势
-                const chartDefs = [
-                    { id: 'chart-commits', title: 'Commits 趋势（14天）', dataKey: 'commits' },
-                    { id: 'chart-issues',  title: 'Issues 趋势（14天）',  dataKey: 'issues' },
-                    { id: 'chart-prs',     title: 'PRs 趋势（14天）',     dataKey: 'prs' },
-                ];
-
+                // 三张图：Commits趋势 / Issues趋势 / PR趋势
                 const legendHtml = buildAvatarLegend(repoList);
 
+                // PR 图表有 toggle，其他两张图直接渲染
                 let html = '';
-                chartDefs.forEach(def => {
-                    html += `<div class="card" style="margin-bottom: 16px;">
-                        <h3 style="margin-bottom: 10px;">${def.title}</h3>
-                        ${legendHtml}
-                        <div style="height: 220px;"><canvas id="${def.id}"></canvas></div>
-                    </div>`;
-                });
+                // Commits 图
+                html += `<div class="card" style="margin-bottom: 16px;">
+                    <h3 style="margin-bottom: 10px;">Commits 趋势（14天）</h3>
+                    ${legendHtml}
+                    <div style="height: 220px;"><canvas id="chart-commits"></canvas></div>
+                </div>`;
+                // Issues 图
+                html += `<div class="card" style="margin-bottom: 16px;">
+                    <h3 style="margin-bottom: 10px;">Issues 趋势（14天）</h3>
+                    ${legendHtml}
+                    <div style="height: 220px;"><canvas id="chart-issues"></canvas></div>
+                </div>`;
+                // PR 图（带 toggle）
+                html += `<div class="card" style="margin-bottom: 16px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+                        <h3>PR 趋势（14天）</h3>
+                        <div class="pr-toggle-group" id="pr-toggle-group">
+                            <button class="pr-toggle-btn active" data-mode="all" onclick="switchPRMode('all')">All</button>
+                            <button class="pr-toggle-btn" data-mode="open" onclick="switchPRMode('open')">Open</button>
+                            <button class="pr-toggle-btn" data-mode="merged" onclick="switchPRMode('merged')">Merged</button>
+                        </div>
+                    </div>
+                    ${legendHtml}
+                    <div style="height: 220px;"><canvas id="chart-prs"></canvas></div>
+                </div>`;
 
                 document.getElementById('trends-content').innerHTML = html;
 
-                // 渲染三张折线图（隐藏内置 legend，用自定义 avatar legend）
-                chartDefs.forEach(def => {
+                // 缓存 trends 数据供 toggle 使用
+                window._trendsRepoList = repoList;
+                window._trendsDateRange = dateRange;
+                window._trendsDays = days;
+                window._prMode = 'all';
+
+                // 渲染 Commits 和 Issues 图（面积图）
+                ['commits', 'issues'].forEach((dataKey, idx) => {
+                    const canvasId = dataKey === 'commits' ? 'chart-commits' : 'chart-issues';
                     const datasets = repoList.map(([fullName, data], i) => {
                         const color = TREND_COLORS[i % TREND_COLORS.length];
                         return {
                             label: data.display_name,
-                            data: fillSeries(dateRange, data[def.dataKey]),
+                            data: fillSeries(dateRange, data[dataKey]),
                             borderColor: color.line,
                             backgroundColor: color.fill,
                             pointBackgroundColor: color.line,
                             borderWidth: 2,
                             pointRadius: 3,
                             pointHoverRadius: 5,
-                            fill: false,
+                            fill: true,
                             tension: 0.3,
                         };
                     });
-                    makeMultiLineChart(def.id, dateRange, datasets, days);
+                    makeMultiLineChart(canvasId, dateRange, datasets, days);
                 });
+
+                // 渲染 PR 图（默认 All 模式）
+                renderPRChart('all');
 
             } catch (e) {
                 document.getElementById('trends-content').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
             }
+        }
+
+        function renderPRChart(mode) {
+            const repoList = window._trendsRepoList;
+            const dateRange = window._trendsDateRange;
+            const days = window._trendsDays;
+            if (!repoList) return;
+
+            const datasets = repoList.map(([fullName, data], i) => {
+                const color = TREND_COLORS[i % TREND_COLORS.length];
+                let seriesData;
+                if (mode === 'open') {
+                    seriesData = fillSeries(dateRange, data['open_prs']);
+                } else if (mode === 'merged') {
+                    seriesData = fillSeries(dateRange, data['merged_prs']);
+                } else {
+                    // all = open + merged combined
+                    const openArr = fillSeries(dateRange, data['open_prs']);
+                    const mergedArr = fillSeries(dateRange, data['merged_prs']);
+                    seriesData = openArr.map((v, idx) => v + mergedArr[idx]);
+                }
+                return {
+                    label: data.display_name,
+                    data: seriesData,
+                    borderColor: color.line,
+                    backgroundColor: color.fill,
+                    pointBackgroundColor: color.line,
+                    borderWidth: 2,
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    fill: true,
+                    tension: 0.3,
+                };
+            });
+            makeMultiLineChart('chart-prs', dateRange, datasets, days);
+        }
+
+        function switchPRMode(mode) {
+            window._prMode = mode;
+            // 更新按钮状态
+            document.querySelectorAll('.pr-toggle-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+            renderPRChart(mode);
         }
 
         // ── Agents ─────────────────────────────────────────────────────────────────

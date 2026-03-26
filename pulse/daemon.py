@@ -3,6 +3,7 @@ import logging
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -56,19 +57,22 @@ class PulseDaemon:
                 logger.error(f"采集 {repo.full_name} 失败: {e}")
                 errors.append(f"采集失败: {repo.full_name} — {e}")
 
-        # 2. LLM 分析
-        for repo in cfg.enabled_repos:
-            logger.info(f"分析 {repo.full_name} ...")
-            try:
-                analysis = analyzer.analyze_repo(repo)
-                if analysis:
-                    repo_reports[repo.display_name] = analysis
-                    logger.info(f"✓ 分析完成: {repo.full_name}")
-                else:
-                    logger.warning(f"分析返回空: {repo.full_name}")
-            except Exception as e:
-                logger.error(f"分析 {repo.full_name} 失败: {e}")
-                errors.append(f"分析失败: {repo.full_name} — {e}")
+        # 2. LLM 分析（并行）
+        logger.info("LLM 分析（并行）...")
+        with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
+            future_to_repo = {executor.submit(analyzer.analyze_repo, repo): repo for repo in cfg.enabled_repos}
+            for future in as_completed(future_to_repo):
+                repo = future_to_repo[future]
+                try:
+                    analysis = future.result()
+                    if analysis:
+                        repo_reports[repo.display_name] = analysis
+                        logger.info(f"✓ 分析完成: {repo.full_name}")
+                    else:
+                        logger.warning(f"分析返回空: {repo.full_name}")
+                except Exception as e:
+                    logger.error(f"分析 {repo.full_name} 失败: {e}")
+                    errors.append(f"分析失败: {repo.full_name} — {e}")
 
         # 3. 生成全局分析
         global_report = None

@@ -3,6 +3,7 @@ import click
 import json
 import sys
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -146,16 +147,21 @@ def report(ctx, date, repo, generate, push):
         repos = [r for r in repos if r.full_name == repo]
 
     if generate:
-        click.echo(f"生成 {date} 的分析报告...")
+        click.echo(f"生成 {date} 的分析报告（并行）...")
         repo_reports = {}
-        for r in repos:
-            click.echo(f"  分析 {r.full_name} ...")
-            analysis = analyzer.analyze_repo(r)
-            if analysis:
-                repo_reports[r.display_name] = analysis
-                click.echo(f"  ✓ {r.full_name}")
-            else:
-                click.echo(f"  ✗ {r.full_name} 分析失败")
+        with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
+            future_to_repo = {executor.submit(analyzer.analyze_repo, r): r for r in repos}
+            for future in as_completed(future_to_repo):
+                r = future_to_repo[future]
+                try:
+                    analysis = future.result()
+                    if analysis:
+                        repo_reports[r.display_name] = analysis
+                        click.echo(f"  ✓ {r.full_name}")
+                    else:
+                        click.echo(f"  ✗ {r.full_name} 分析失败")
+                except Exception as e:
+                    click.echo(f"  ✗ {r.full_name} 异常: {e}")
 
         if not repo and len(repo_reports) > 1:
             click.echo("  生成综合分析...")
@@ -333,15 +339,20 @@ def run_pipeline(ctx, push):
         fetch_results[r.full_name] = results
         click.echo(f"  ✓ {results}")
 
-    # 2. 分析
-    click.echo("\n[2/3] LLM 分析")
+    # 2. 分析（并行）
+    click.echo("\n[2/3] LLM 分析（并行）")
     repo_reports = {}
-    for r in cfg.enabled_repos:
-        click.echo(f"  分析 {r.full_name} ...")
-        analysis = analyzer.analyze_repo(r)
-        if analysis:
-            repo_reports[r.display_name] = analysis
-            click.echo(f"  ✓")
+    with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
+        future_to_repo = {executor.submit(analyzer.analyze_repo, r): r for r in cfg.enabled_repos}
+        for future in as_completed(future_to_repo):
+            r = future_to_repo[future]
+            try:
+                analysis = future.result()
+                if analysis:
+                    repo_reports[r.display_name] = analysis
+                    click.echo(f"  ✓ {r.full_name}")
+            except Exception as e:
+                click.echo(f"  ✗ {r.full_name} 异常: {e}")
 
     global_report = None
     if len(repo_reports) > 1:
