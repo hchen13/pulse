@@ -2004,6 +2004,8 @@ def get_dashboard_html() -> str:
                 displayName = '全局综合';
             } else if (isRepoSynthesis) {
                 displayName = `${repoDisplay} 合成`;
+            } else if (step.step_name === 'fetch') {
+                displayName = `采集 ${repoDisplay}`;
             } else {
                 displayName = `${repoDisplay}/${stepLabel}`;
             }
@@ -2195,10 +2197,24 @@ def get_dashboard_html() -> str:
         }
 
         // WS event handlers for live workflow update
+        let _wfStartTime = null;
         function handleWorkflowEvent(eventType, data) {
             if (eventType === 'workflow_start') {
                 _wfLiveStates = {};
-                loadWorkflowTimeline(false);
+                _wfStartTime = new Date();
+                // Clear timeline immediately
+                const wrap = document.getElementById('workflow-timeline-wrap');
+                if (wrap) {
+                    const startStr = _wfStartTime.toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+                    wrap.innerHTML = `<div class="workflow-container">
+                        <div class="workflow-header">
+                            <span class="run-date">开始时间: ${startStr}</span>
+                            <span style="color:#7aa2f7; font-size:12px;" class="spin">↻</span>
+                            <span style="color:#7aa2f7; font-size:12px;">运行中...</span>
+                        </div>
+                    </div>`;
+                }
+                return;
             } else if (eventType === 'step_start') {
                 const stepKey = data.step || '';
                 _wfLiveStates[stepKey] = { status: 'running', duration_s: null };
