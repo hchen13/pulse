@@ -2249,6 +2249,15 @@ def get_dashboard_html() -> str:
                 _wfLiveStates = {};
                 _wfStartTime = new Date();
                 // Render all expected steps in pending (gray) state
+                // Ensure repos data is loaded (sync fetch if needed)
+                if (!repos || repos.length === 0) {
+                    try {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('GET', `${_basePath}/api/stats`, false);
+                        xhr.send();
+                        if (xhr.status === 200) repos = JSON.parse(xhr.responseText);
+                    } catch(e) {}
+                }
                 // Server broadcasts use display_name for analysis steps, full_name for fetch
                 for (const r of repos) {
                     _wfLiveStates[`fetch/${r.full_name}`] = { status: 'pending', duration_s: null };
