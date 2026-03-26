@@ -19,7 +19,7 @@ collection:
 schedule:
   cron: 0 6 * * *
 analysis:
-  claude_bin: claude
+  claude_bin: /Users/claire/.local/bin/claude
   model: claude-haiku-4-5
   max_tokens: 2000
   models:
