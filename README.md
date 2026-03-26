@@ -1,3 +1,5 @@
+**English** | [中文](README_CN.md)
+
 # Pulse
 
 Continuous intelligence on the AI agent tooling ecosystem.
