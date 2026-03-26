@@ -186,11 +186,9 @@ def _run_full_cycle():
             _run_status["steps"] = []
             _run_status["current_step"] = None
 
-        # 清除当天旧的 analysis_steps（重新跑时覆盖）
         today = datetime.now().strftime("%Y-%m-%d")
-        with get_db(cfg.storage.db_path) as conn:
-            conn.execute("DELETE FROM analysis_steps WHERE report_date = ?", (today,))
-            conn.execute("DELETE FROM reports WHERE report_date = ?", (today,))
+        # 不删旧报告——新结果通过 INSERT OR REPLACE 自然覆盖
+        # analysis_steps 也保留，新步骤完成时逐个覆盖
 
         broadcast_event("workflow_start", {
             "run_id": run_id,
