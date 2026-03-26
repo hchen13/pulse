@@ -220,12 +220,19 @@ def _run_full_cycle():
 
         repo_reports = {}
         # 采集并行
+        import time as _time
         from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
         logger.info(f"[run] 开始并行采集 {len(repos)} 个项目")
+        tracked_broadcast("step_start", {"step": "fetch/all", "run_id": run_id})
+        fetch_start = _time.time()
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             def _fetch_repo(repo):
+                t0 = _time.time()
+                tracked_broadcast("step_start", {"step": f"fetch/{repo.full_name}", "run_id": run_id})
                 logger.info(f"[run] 采集 {repo.full_name}")
                 collector.fetch_all(repo)
+                dur = _time.time() - t0
+                tracked_broadcast("step_done", {"step": f"fetch/{repo.full_name}", "run_id": run_id, "duration_s": round(dur, 1)})
                 return repo.full_name
             fetch_futures = {executor.submit(_fetch_repo, repo): repo for repo in repos}
             for future in _as_completed(fetch_futures):
@@ -235,6 +242,8 @@ def _run_full_cycle():
                     logger.info(f"[run] 采集完成: {repo.full_name}")
                 except Exception as e:
                     logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
+        fetch_dur = _time.time() - fetch_start
+        tracked_broadcast("step_done", {"step": "fetch/all", "run_id": run_id, "duration_s": round(fetch_dur, 1)})
 
         logger.info("[run] Phase 1: 维度分析（并行）")
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
@@ -2071,9 +2080,13 @@ def get_dashboard_html() -> str:
                     return;
                 }
 
-                // Separate into Phase 1 (dimension steps) and Phase 2 (synthesis steps, all parallel)
+                // Separate into phases
+                // Phase 0: fetch steps (from live run status, name starts with "fetch/")
+                const fetchSteps = steps.filter(s => (s.step_name || s.name || '').startsWith('fetch/') && (s.step_name || s.name || '') !== 'fetch/all');
+                const fetchAllStep = steps.find(s => (s.step_name || s.name || '') === 'fetch/all');
+                // Phase 1: dimension analysis
                 const dimStepNames = new Set(['issues', 'prs', 'commits', 'main']);
-                const phase1Steps = steps.filter(s => s.repo_full_name !== '__global__' && dimStepNames.has(s.step_name));
+                const phase1Steps = steps.filter(s => s.repo_full_name !== '__global__' && dimStepNames.has(s.step_name) && !(s.step_name || '').startsWith('fetch/'));
                 // Phase 2: repo synthesis + global synthesis (all run in parallel after Phase 1)
                 const phase2Steps = steps.filter(s => s.step_name === 'synthesis');
 
@@ -2102,6 +2115,28 @@ def get_dashboard_html() -> str:
                     ${totalStr ? `<span class="run-total">总耗时 ${escapeHtml(totalStr)}</span>` : ''}
                     ${isRunning ? '<span style="color:#7aa2f7; font-size:12px;" class="spin">↻</span> <span style="color:#7aa2f7; font-size:12px;">运行中</span>' : ''}
                 </div>`;
+
+                // Phase 0: 数据采集
+                if (fetchSteps.length > 0 || fetchAllStep) {
+                    const fetchDur = fetchAllStep ? fmtSeconds(fetchAllStep.duration_s || 0) : '';
+                    html += `<div class="phase-block">
+                        <div class="phase-label">
+                            <span>数据采集（${fetchSteps.length} 项目并行）</span>
+                            ${fetchDur ? `<span class="phase-duration">${fetchDur}</span>` : ''}
+                        </div>`;
+                    const sortedFetch = [...fetchSteps].sort((a, b) => (a.duration_s || 999) - (b.duration_s || 999));
+                    sortedFetch.forEach((step, i) => {
+                        // Adapt fetch step to look like analysis step for rendering
+                        const adapted = {
+                            ...step,
+                            repo_full_name: (step.step_name || step.name || '').replace('fetch/', ''),
+                            step_name: 'fetch',
+                            model: '—',
+                        };
+                        html += renderTimelineItem(adapted, `f-${i}`, isRunning);
+                    });
+                    html += `</div>`;
+                }
 
                 // Phase 1
                 const phase1Label = `Phase 1: 维度分析（并行）`;
