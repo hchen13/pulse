@@ -1132,11 +1132,11 @@ def get_dashboard_html() -> str:
         }
         .repo-row:last-child { border-bottom: none; }
         .repo-row:hover { background: rgba(122,162,247,0.04); }
-        .repo-row-name { flex: 1; min-width: 0; }
-        .repo-row-name .rn-title { font-size: 13px; color: #e0e2f0; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .repo-row-name { flex: 0 0 auto; min-width: 160px; }
+        .repo-row-name .rn-title { font-size: 13px; color: #e0e2f0; font-weight: 500; }
         .repo-row-name .rn-link { font-size: 11px; color: #565f89; text-decoration: none; }
         .repo-row-name .rn-link:hover { color: #7aa2f7; }
-        .repo-row-stats { display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+        .repo-row-stats { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
         .rstat { font-size: 11px; color: #a9b1d6; white-space: nowrap; }
         .rstat span { font-weight: 600; color: #e0e2f0; }
         .repo-row .delete-btn { opacity: 0; transition: opacity 0.15s; }
@@ -1210,6 +1210,10 @@ def get_dashboard_html() -> str:
             font-size: 11px; color: #2a2d3e; letter-spacing: 2px;
             overflow: hidden; text-overflow: clip; white-space: nowrap;
             text-align: right;
+        }
+        .tl-time {
+            font-size: 11px; color: #565f89; flex-shrink: 0;
+            font-family: 'Menlo', monospace; font-variant-numeric: tabular-nums;
         }
         .tl-duration {
             font-size: 12px; color: #7aa2f7; flex-shrink: 0;
@@ -1957,6 +1961,15 @@ def get_dashboard_html() -> str:
             const durStr = fmtSeconds(duration);
 
             // Use data-* attributes to avoid quote escaping in onclick
+            // Calculate start time from created_at - duration_s
+            let timeStr = '';
+            if (step.created_at && duration > 0) {
+                const endTime = new Date(step.created_at.replace(' ', 'T') + 'Z');
+                const startTime = new Date(endTime.getTime() - duration * 1000);
+                const fmt = (d) => d.toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+                timeStr = `${fmt(startTime)} → ${fmt(endTime)}`;
+            }
+
             return `<div class="timeline-item" id="tl-${idx}"
                 data-repo="${escapeHtml(step.repo_full_name)}"
                 data-step="${escapeHtml(step.step_name)}"
@@ -1964,6 +1977,7 @@ def get_dashboard_html() -> str:
                 onclick="handleTimelineClick(this)">
                 <span class="tl-icon ${status}">${icon}</span>
                 <span class="tl-name">${escapeHtml(displayName)}</span>
+                ${timeStr ? `<span class="tl-time">${timeStr}</span>` : ''}
                 <span class="tl-leader">${dotLeader()}</span>
                 <span class="tl-duration">${escapeHtml(durStr)}</span>
                 <span class="tl-model">${escapeHtml(model)}</span>
