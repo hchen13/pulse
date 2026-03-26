@@ -176,7 +176,7 @@ def _run_full_cycle():
         # Phase 1: 每个 repo 有 issues/prs/commits/main 共 4 步
         # Phase 2: 每个 repo 有 synthesis 1 步 + 1 个全局综合
         # total = repos * 4 + repos + 1 (when repos > 1)
-        total_steps = len(repos) * 4 + (len(repos) + 1 if len(repos) > 1 else 0)
+        total_steps = len(repos) + len(repos) * 4 + len(repos) + 1  # fetch + dims + repo synthesis + global
 
         # 初始化步骤状态
         _step_states = {}
@@ -253,39 +253,35 @@ def _run_full_cycle():
         fetch_dur = _time.time() - fetch_start
         tracked_broadcast("step_done", {"step": "fetch/all", "run_id": run_id, "duration_s": round(fetch_dur, 1)})
 
-        logger.info("[run] Phase 1: 维度分析（并行）")
+        # 每个 repo 独立流水线：维度分析完成 → 立即合成
+        logger.info("[run] 开始分析（每个 repo 独立流水线）")
+        def _repo_pipeline(repo):
+            logger.info(f"[run] {repo.full_name}: 维度分析开始")
+            ok = analyzer.analyze_repo(repo, 7, run_id)
+            if ok:
+                logger.info(f"[run] {repo.full_name}: 维度分析完成，开始合成")
+                synthesis = analyzer.analyze_repo_synthesis(repo, run_id)
+                if synthesis:
+                    repo_reports[repo.display_name] = synthesis
+                    logger.info(f"[run] {repo.full_name}: 合成完成")
+            return ok
+
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
-            future_to_repo = {executor.submit(analyzer.analyze_repo, repo, 7, run_id): repo for repo in repos}
-            for future in _as_completed(future_to_repo):
-                repo = future_to_repo[future]
+            pipeline_futures = {executor.submit(_repo_pipeline, repo): repo for repo in repos}
+            for future in _as_completed(pipeline_futures):
+                repo = pipeline_futures[future]
                 try:
-                    ok = future.result()
-                    if ok:
-                        logger.info(f"[run] 维度分析完成: {repo.full_name}")
+                    future.result()
                 except Exception as e:
-                    logger.error(f"[run] 分析失败 {repo.full_name}: {e}")
+                    logger.error(f"[run] 流水线失败 {repo.full_name}: {e}")
 
-        if len(repos) > 1:
-            logger.info("[run] Phase 2: repo 合成 + 全局综合（并行）")
-            with ThreadPoolExecutor(max_workers=len(repos) + 1) as executor:
-                synthesis_futures = {executor.submit(analyzer.analyze_repo_synthesis, repo, run_id): repo for repo in repos}
-                global_future = executor.submit(analyzer.analyze_global, run_id)
-
-                for future in _as_completed(synthesis_futures):
-                    repo = synthesis_futures[future]
-                    try:
-                        synthesis = future.result()
-                        if synthesis:
-                            repo_reports[repo.display_name] = synthesis
-                            logger.info(f"[run] 合成完成: {repo.full_name}")
-                    except Exception as e:
-                        logger.error(f"[run] 合成失败 {repo.full_name}: {e}")
-
-                try:
-                    global_future.result()
-                    logger.info("[run] 全局综合完成")
-                except Exception as e:
-                    logger.error(f"[run] 全局分析失败: {e}")
+        # 全局综合（等所有维度分析完成后启动）
+        logger.info("[run] 全局综合开始")
+        try:
+            analyzer.analyze_global(run_id)
+            logger.info("[run] 全局综合完成")
+        except Exception as e:
+            logger.error(f"[run] 全局分析失败: {e}")
 
         try:
             analyzer.cleanup_old_data(days=40)
@@ -1623,9 +1619,20 @@ def get_dashboard_html() -> str:
                         }
                         if (s.error) alert(`分析出错: ${s.error}`);
                     } else {
-                        const elapsed = s.elapsed_s ? `${s.elapsed_s}s` : '';
-                        const progress = s.progress || '';
-                        statusText.textContent = `正在执行 ${progress} ${elapsed}`;
+                        const elapsed = s.elapsed_s ? Math.round(s.elapsed_s) + 's' : '';
+                        // 按阶段显示进度
+                        const steps = s.steps || [];
+                        const fetchDone = steps.filter(x => x.name?.startsWith('fetch/') && x.status === 'done').length;
+                        const fetchTotal = steps.filter(x => x.name?.startsWith('fetch/') && x.name !== 'fetch/all').length;
+                        const analysisDone = steps.filter(x => !x.name?.startsWith('fetch/') && x.status === 'done').length;
+                        const analysisTotal = steps.filter(x => !x.name?.startsWith('fetch/')).length;
+                        let phaseText = '';
+                        if (fetchTotal > 0 && fetchDone < fetchTotal) {
+                            phaseText = `采集 ${fetchDone}/${fetchTotal}`;
+                        } else if (analysisTotal > 0) {
+                            phaseText = `分析 ${analysisDone}/${analysisTotal}`;
+                        }
+                        statusText.textContent = `${phaseText} ${elapsed}`.trim();
                         // Update timeline if on workflow tab
                         const activeTab = document.querySelector('.nav-tab.active');
                         if (activeTab && activeTab.textContent === 'Workflow') {
