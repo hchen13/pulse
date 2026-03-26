@@ -2616,10 +2616,13 @@ websocat -v ${wsUrl}`;
             }
         });
 
-        // 点击 WS API modal 外部关闭
-        document.getElementById('ws-api-modal').addEventListener('click', function(e) {
-            if (e.target === this) closeWsApiModal();
-        });
+        // 点击 WS API modal 外部关闭（延迟绑定，因为 modal DOM 在 script 之后）
+        setTimeout(() => {
+            const wsModal = document.getElementById('ws-api-modal');
+            if (wsModal) wsModal.addEventListener('click', function(e) {
+                if (e.target === this) closeWsApiModal();
+            });
+        }, 0);
 
                 // 初始化
         checkRunStatus();
