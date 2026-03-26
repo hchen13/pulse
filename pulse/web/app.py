@@ -1080,10 +1080,71 @@ def get_dashboard_html() -> str:
         .md-content a { color: #7aa2f7; text-decoration: none; }
         .md-content a:hover { text-decoration: underline; }
 
-        /* ── Insight card ── */
+        /* ── Overview two-column layout ── */
+        .overview-layout {
+            display: grid;
+            grid-template-columns: 1fr 360px;
+            gap: 20px;
+            align-items: start;
+        }
+        @media (max-width: 900px) {
+            .overview-layout { grid-template-columns: 1fr; }
+            .overview-right { order: -1; }
+        }
+        /* Left: insight panel */
+        .overview-left { min-width: 0; }
+        .insight-panel {
+            background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px;
+            padding: 20px 24px; height: 100%;
+        }
+        .insight-panel-header {
+            display: flex; align-items: center; gap: 10px;
+            margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #2a2d3e;
+        }
+        .insight-panel-title { font-size: 14px; color: #e0e2f0; font-weight: 600; }
+        .insight-badge { display: inline-block; background: rgba(158,206,106,0.12); color: #9ece6a; padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+        /* Right: data panel */
+        .overview-right { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+        /* Compact stats row */
+        .stats-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+        }
+        .stat-mini {
+            background: #16161e; border: 1px solid #2a2d3e; border-radius: 7px;
+            padding: 12px 14px;
+        }
+        .stat-mini-label { font-size: 10px; color: #565f89; text-transform: uppercase; letter-spacing: 0.7px; }
+        .stat-mini-num { font-size: 22px; font-weight: 700; color: #e0e2f0; line-height: 1.2; margin-top: 3px; }
+        /* Compact repo list */
+        .repos-panel {
+            background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px;
+            overflow: hidden;
+        }
+        .repos-panel-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 11px 14px; border-bottom: 1px solid #2a2d3e;
+        }
+        .repos-panel-title { font-size: 12px; color: #565f89; text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; }
+        .repo-row {
+            display: flex; align-items: center; gap: 8px;
+            padding: 9px 14px; border-bottom: 1px solid rgba(42,45,62,0.6);
+            transition: background 0.12s;
+        }
+        .repo-row:last-child { border-bottom: none; }
+        .repo-row:hover { background: rgba(122,162,247,0.04); }
+        .repo-row-name { flex: 1; min-width: 0; }
+        .repo-row-name .rn-title { font-size: 13px; color: #e0e2f0; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .repo-row-name .rn-link { font-size: 11px; color: #565f89; text-decoration: none; }
+        .repo-row-name .rn-link:hover { color: #7aa2f7; }
+        .repo-row-stats { display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+        .rstat { font-size: 11px; color: #a9b1d6; white-space: nowrap; }
+        .rstat span { font-weight: 600; color: #e0e2f0; }
+        .repo-row .delete-btn { opacity: 0; transition: opacity 0.15s; }
+        .repo-row:hover .delete-btn { opacity: 1; }
+
+        /* ── Insight card (legacy, kept for compat) ── */
         .insight-card { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; padding: 20px 24px; margin-top: 20px; }
         .insight-card-title { font-size: 13px; color: #565f89; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid #2a2d3e; font-weight: 500; }
-        .insight-badge { display: inline-block; background: rgba(158,206,106,0.12); color: #9ece6a; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin-left: 8px; vertical-align: middle; text-transform: none; letter-spacing: 0; }
 
         /* ── Controls ── */
         .flex-between { display: flex; justify-content: space-between; align-items: center; }
@@ -1281,14 +1342,38 @@ def get_dashboard_html() -> str:
     <div class="container">
         <!-- 概览 -->
         <div id="tab-overview" class="tab-content active">
-            <div id="repos-overview" class="loading">加载中...</div>
-            <div id="today-insight" style="display:none;">
-                <div class="insight-card">
-                    <div class="insight-card-title">
-                        今日洞察
-                        <span class="insight-badge" id="insight-date"></span>
+            <div class="overview-layout">
+                <!-- 左侧：今日洞察 -->
+                <div class="overview-left">
+                    <div class="insight-panel">
+                        <div class="insight-panel-header">
+                            <span class="insight-panel-title">今日洞察</span>
+                            <span class="insight-badge" id="insight-date">加载中...</span>
+                        </div>
+                        <div id="insight-content" class="md-content">
+                            <div class="loading">加载中...</div>
+                        </div>
                     </div>
-                    <div id="insight-content" class="md-content"></div>
+                </div>
+                <!-- 右侧：数据面板 -->
+                <div class="overview-right">
+                    <!-- 统计指标 2×2 -->
+                    <div class="stats-grid" id="stats-grid">
+                        <div class="stat-mini"><div class="stat-mini-label">Open Issues</div><div class="stat-mini-num" id="stat-issues">—</div></div>
+                        <div class="stat-mini"><div class="stat-mini-label">Open PRs</div><div class="stat-mini-num" id="stat-prs">—</div></div>
+                        <div class="stat-mini"><div class="stat-mini-label">Merged PRs</div><div class="stat-mini-num" id="stat-merged">—</div></div>
+                        <div class="stat-mini"><div class="stat-mini-label">7日 Commits</div><div class="stat-mini-num" id="stat-commits">—</div></div>
+                    </div>
+                    <!-- 监控项目列表 -->
+                    <div class="repos-panel">
+                        <div class="repos-panel-header">
+                            <span class="repos-panel-title">监控项目</span>
+                            <button class="btn btn-success btn-sm" onclick="openAddRepoModal()">+ 添加</button>
+                        </div>
+                        <div id="repos-list">
+                            <div class="loading" style="padding:20px;">加载中...</div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1526,66 +1611,34 @@ def get_dashboard_html() -> str:
                 const totalMerged = stats.reduce((s, r) => s + (r.merged_prs_7d || 0), 0);
                 const totalCommits = stats.reduce((s, r) => s + r.commits_7d, 0);
 
-                let html = `<div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:14px; margin-bottom:22px;">
-                    <div class="card">
-                        <h3>Open Issues</h3>
-                        <div class="stat-big">${totalIssues}</div>
-                        <div class="stat-sub">跨 ${stats.length} 个项目</div>
-                    </div>
-                    <div class="card">
-                        <h3>Open PRs</h3>
-                        <div class="stat-big">${totalPRs}</div>
-                        <div class="stat-sub">待合并</div>
-                    </div>
-                    <div class="card">
-                        <h3>Merged PRs</h3>
-                        <div class="stat-big">${totalMerged}</div>
-                        <div class="stat-sub">近 7 天已合并</div>
-                    </div>
-                    <div class="card">
-                        <h3>7日 Commits</h3>
-                        <div class="stat-big">${totalCommits}</div>
-                        <div class="stat-sub">近 7 天活跃度</div>
-                    </div>
-                </div>`;
+                // Update stat mini cards
+                document.getElementById('stat-issues').textContent = totalIssues;
+                document.getElementById('stat-prs').textContent = totalPRs;
+                document.getElementById('stat-merged').textContent = totalMerged;
+                document.getElementById('stat-commits').textContent = totalCommits;
 
-                html += `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                    <div class="section-title" style="margin:0;">监控项目</div>
-                    <button class="btn btn-success btn-sm" onclick="openAddRepoModal()">+ 添加项目</button>
-                </div>`;
-
+                // Compact repo rows
+                let repoHtml = '';
                 for (const r of stats) {
-                    const lastFetch = r.last_fetch ? r.last_fetch.substring(0, 16).replace('T', ' ') : '从未';
                     const release = r.latest_release
-                        ? `${r.latest_release.tag_name} <span style="color:#565f89;">(${(r.latest_release.published_at || '').substring(0, 10)})</span>`
-                        : '<span style="color:#565f89;">-</span>';
-                    html += `<div class="repo-card">
-                        <div class="repo-header">
-                            <div class="repo-header-left">
-                                <h2>${escapeHtml(r.display_name)}</h2>
-                                <a href="https://github.com/${r.full_name}" target="_blank">${r.full_name} ↗</a>
-                            </div>
-                            <div class="repo-header-right">
-                                <button class="btn btn-danger btn-sm delete-btn" onclick="deleteRepo('${r.full_name}')">删除</button>
-                            </div>
+                        ? r.latest_release.tag_name
+                        : '—';
+                    repoHtml += `<div class="repo-row">
+                        <div class="repo-row-name">
+                            <div class="rn-title">${escapeHtml(r.display_name)}</div>
+                            <a class="rn-link" href="https://github.com/${r.full_name}" target="_blank">${r.full_name} ↗</a>
                         </div>
-                        <div class="repo-stats">
-                            <div class="repo-stat"><div class="num">${r.issues_open}</div><div class="label">Open Issues</div></div>
-                            <div class="repo-stat"><div class="num">${r.prs_open}</div><div class="label">Open PRs</div></div>
-                            <div class="repo-stat"><div class="num">${r.merged_prs_7d || 0}</div><div class="label">Merged PRs</div></div>
-                            <div class="repo-stat"><div class="num">${r.commits_7d}</div><div class="label">7日 Commits</div></div>
-                            <div class="repo-stat" style="text-align:left; flex:1; margin-left:16px;">
-                                <div style="font-size:12px; color:#565f89; text-transform:uppercase; letter-spacing:0.5px;">Latest Release</div>
-                                <div style="font-size:13px; margin-top:4px;">${release}</div>
-                                <div class="stat-sub" style="margin-top:6px;">最后采集: ${lastFetch}</div>
-                            </div>
+                        <div class="repo-row-stats">
+                            <span class="rstat"><span>${r.issues_open}</span> issues</span>
+                            <span class="rstat"><span>${r.prs_open}</span> PRs</span>
+                            <span class="rstat" style="color:#565f89;">${escapeHtml(release)}</span>
                         </div>
+                        <button class="btn btn-danger btn-sm delete-btn" onclick="deleteRepo('${r.full_name}')">删除</button>
                     </div>`;
                 }
-
-                document.getElementById('repos-overview').innerHTML = html;
+                document.getElementById('repos-list').innerHTML = repoHtml || '<div style="padding:14px;color:#565f89;font-size:13px;">暂无项目</div>';
             } catch (e) {
-                document.getElementById('repos-overview').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
+                document.getElementById('repos-list').innerHTML = `<div class="error-msg" style="margin:12px;">加载失败: ${e.message}</div>`;
             }
         }
 
@@ -1620,15 +1673,20 @@ def get_dashboard_html() -> str:
             try {
                 const reports = await fetchJSON('api/reports?days=7');
                 const dates = [...new Set(reports.map(r => r.report_date))].sort().reverse();
-                if (!dates.length) return;
+                if (!dates.length) {
+                    document.getElementById('insight-date').textContent = '暂无数据';
+                    document.getElementById('insight-content').innerHTML = '<div style="color:#565f89; padding:20px 0; text-align:center; font-size:13px;">尚未运行分析，点击「立即分析」生成报告</div>';
+                    return;
+                }
 
                 const latestDate = dates[0];
                 const global = await fetchJSON(`api/report/${latestDate}`);
 
                 document.getElementById('insight-date').textContent = latestDate;
                 document.getElementById('insight-content').innerHTML = marked.parse(global.content || '');
-                document.getElementById('today-insight').style.display = 'block';
-            } catch (e) { /* 无报告时静默 */ }
+            } catch (e) {
+                document.getElementById('insight-content').innerHTML = '<div style="color:#565f89; padding:20px 0; font-size:13px;">加载失败</div>';
+            }
         }
 
         async function loadReport() {
