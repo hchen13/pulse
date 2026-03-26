@@ -372,6 +372,67 @@ def run_pipeline(ctx, push):
     click.echo("\n✅ 完成！")
 
 
+@cli.command("progress")
+@click.option("--port", "-p", default=None, type=int, help="Web 服务端口（默认从配置读取）")
+@click.pass_context
+def progress(ctx, port):
+    """查看当前执行进度"""
+    cfg = _load_cfg(ctx.obj.get("config_path"))
+    ws_port = port or cfg.web.port
+    import requests
+
+    url = f"http://localhost:{ws_port}/api/run/status"
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        s = resp.json()
+    except Exception as e:
+        click.echo(f"无法连接到 pulse web 服务（端口 {ws_port}）: {e}", err=True)
+        return
+
+    if not s.get("running") and not s.get("finished_at"):
+        click.echo("当前没有正在运行或最近完成的任务。")
+        return
+
+    click.echo("")
+    if s.get("started_at"):
+        started = s["started_at"][:16].replace("T", " ")
+        click.echo(f"Run:      {started}")
+
+    progress_str = s.get("progress")
+    if progress_str:
+        total = s.get("total_steps", 0)
+        done_count = int(progress_str.split("/")[0]) if "/" in progress_str else 0
+        pct = round(done_count / total * 100) if total else 0
+        click.echo(f"Progress: {progress_str} ({pct}%)")
+
+    if s.get("running") and s.get("current_step"):
+        click.echo(f"Current:  {s['current_step']} 分析中")
+    elif s.get("result"):
+        click.echo(f"Status:   {s['result']}")
+    elif s.get("error"):
+        click.echo(f"Error:    {s['error']}")
+
+    elapsed = s.get("elapsed_s")
+    if elapsed is not None:
+        mins = int(elapsed) // 60
+        secs = int(elapsed) % 60
+        if mins:
+            click.echo(f"Elapsed:  {mins}m{secs:02d}s")
+        else:
+            click.echo(f"Elapsed:  {secs}s")
+
+    steps = s.get("steps", [])
+    if steps:
+        click.echo("")
+        click.echo("Steps:")
+        for step in steps:
+            status_icon = "✓" if step["status"] == "done" else "→" if step["status"] == "running" else "·"
+            dur = f" ({step['duration_s']}s)" if step.get("duration_s") else ""
+            click.echo(f"  {status_icon} {step['name']}{dur}")
+    click.echo("")
+
+
 @cli.command("watch")
 @click.option("--follow", "-f", is_flag=True, help="持续监听（默认收到第一个事件后退出）")
 @click.option("--port", "-p", default=None, type=int, help="Web 服务端口（默认从配置读取）")

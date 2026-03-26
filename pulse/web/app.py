@@ -9,6 +9,7 @@ import json
 import logging
 import queue
 import threading
+import time
 import re
 import requests as _requests
 import yaml
@@ -31,8 +32,16 @@ _run_status = {
     "finished_at": None,
     "result": None,
     "error": None,
+    "run_id": None,
+    "steps": [],       # list of {name, status, duration_s}
+    "current_step": None,
+    "total_steps": 0,
+    "elapsed_s": None,
 }
 _run_lock = threading.Lock()
+
+# 运行时步骤跟踪（run_id -> step states）
+_step_states: Dict[str, Dict] = {}  # {step_key: {status, duration_s}}
 
 # WebSocket 连接列表
 _ws_clients: List[WebSocket] = []
@@ -152,18 +161,64 @@ def notify_webhooks(report_date: str, repos: List[str]):
 
 def _run_full_cycle():
     """后台线程：完整采集+分析流程"""
-    global _run_status
+    global _run_status, _step_states
+    import uuid
+    run_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
     try:
         from ..config import load_config
         from ..collectors.github import GitHubCollector
         from ..analyzers.llm import LLMAnalyzer
 
         cfg = load_config(_config_path)
+        repos = cfg.enabled_repos
+        # 每个 repo 有 issues/prs/commits/main 共 4 步，加上每个 repo 合成 + 1 个全局合成
+        # 简化为: repos * 4 + (repos > 1 ? 1 : 0)
+        total_steps = len(repos) * 4 + (1 if len(repos) > 1 else 0)
+
+        # 初始化步骤状态
+        _step_states = {}
+        with _run_lock:
+            _run_status["run_id"] = run_id
+            _run_status["total_steps"] = total_steps
+            _run_status["steps"] = []
+            _run_status["current_step"] = None
+
+        broadcast_event("workflow_start", {
+            "run_id": run_id,
+            "total_steps": total_steps,
+            "date": datetime.now().strftime("%Y-%m-%d"),
+        })
+
+        # Wrapper: intercept step_start/step_done to update _run_status
+        def tracked_broadcast(event_type: str, data: dict):
+            if event_type == "step_start":
+                step_name = data.get("step", "")
+                _step_states[step_name] = {"status": "running", "duration_s": None}
+                with _run_lock:
+                    _run_status["current_step"] = step_name
+                    _run_status["elapsed_s"] = round(time.time() - start_time, 1)
+            elif event_type == "step_done":
+                step_name = data.get("step", "")
+                _step_states[step_name] = {
+                    "status": "done",
+                    "duration_s": data.get("duration_s"),
+                }
+                done_count = sum(1 for s in _step_states.values() if s["status"] == "done")
+                with _run_lock:
+                    _run_status["elapsed_s"] = round(time.time() - start_time, 1)
+                    _run_status["steps"] = [
+                        {"name": k, "status": v["status"], "duration_s": v["duration_s"]}
+                        for k, v in _step_states.items()
+                    ]
+            broadcast_event(event_type, data)
+
         collector = GitHubCollector(cfg.collection, cfg.storage.db_path)
-        analyzer = LLMAnalyzer(cfg.analysis, cfg.storage.db_path)
+        analyzer = LLMAnalyzer(cfg.analysis, cfg.storage.db_path, broadcast_fn=tracked_broadcast)
 
         repo_reports = {}
-        for repo in cfg.enabled_repos:
+        for repo in repos:
             logger.info(f"[run] 采集 {repo.full_name}")
             try:
                 collector.fetch_all(repo)
@@ -172,8 +227,8 @@ def _run_full_cycle():
 
         logger.info("[run] LLM 分析（并行）")
         from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-        with ThreadPoolExecutor(max_workers=len(cfg.enabled_repos) or 1) as executor:
-            future_to_repo = {executor.submit(analyzer.analyze_repo, repo): repo for repo in cfg.enabled_repos}
+        with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
+            future_to_repo = {executor.submit(analyzer.analyze_repo, repo, 7, run_id): repo for repo in repos}
             for future in _as_completed(future_to_repo):
                 repo = future_to_repo[future]
                 try:
@@ -186,7 +241,7 @@ def _run_full_cycle():
         if len(repo_reports) > 1:
             logger.info("[run] 全局综合分析")
             try:
-                analyzer.analyze_global(repo_reports)
+                analyzer.analyze_global(repo_reports, run_id=run_id)
             except Exception as e:
                 logger.error(f"[run] 全局分析失败: {e}")
 
@@ -195,16 +250,20 @@ def _run_full_cycle():
         except Exception as e:
             logger.warning(f"[run] 清理失败: {e}")
 
+        total_duration = round(time.time() - start_time, 1)
         report_date = datetime.now().strftime("%Y-%m-%d")
         with _run_lock:
             _run_status["running"] = False
             _run_status["finished_at"] = datetime.now().isoformat()
             _run_status["result"] = f"完成，共分析 {len(repo_reports)} 个 repo"
+            _run_status["elapsed_s"] = total_duration
 
         # 广播 WebSocket 事件
         broadcast_event("report_ready", {
+            "run_id": run_id,
             "date": report_date,
             "repos": list(repo_reports.keys()),
+            "duration_s": total_duration,
         })
         # Webhook 通知
         notify_webhooks(report_date, list(repo_reports.keys()))
@@ -509,7 +568,61 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @app.get("/api/run/status")
     async def get_run_status():
         with _run_lock:
-            return dict(_run_status)
+            status = dict(_run_status)
+            # Compute progress string
+            done = sum(1 for s in _step_states.values() if s["status"] == "done")
+            total = status.get("total_steps", 0)
+            if total > 0:
+                status["progress"] = f"{done}/{total}"
+            else:
+                status["progress"] = None
+            # Include current steps snapshot
+            if not status.get("steps"):
+                status["steps"] = [
+                    {"name": k, "status": v["status"], "duration_s": v["duration_s"]}
+                    for k, v in _step_states.items()
+                ]
+            return status
+
+    # ── Analysis Steps API ──────────────────────────────────────────────────────
+
+    @app.get("/api/analysis-steps/{date}")
+    async def get_analysis_steps_by_date(date: str):
+        """返回指定日期所有中间步骤"""
+        with get_db(_db_path) as conn:
+            rows = conn.execute("""
+                SELECT * FROM analysis_steps
+                WHERE report_date = ?
+                ORDER BY repo_full_name, step_name
+            """, (date,)).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.get("/api/analysis-steps/{date}/{repo_owner}/{repo_name}")
+    async def get_analysis_steps_by_repo(date: str, repo_owner: str, repo_name: str):
+        """返回指定 repo 的步骤"""
+        full_name = f"{repo_owner}/{repo_name}"
+        with get_db(_db_path) as conn:
+            rows = conn.execute("""
+                SELECT * FROM analysis_steps
+                WHERE report_date = ? AND repo_full_name = ?
+                ORDER BY step_name
+            """, (date, full_name)).fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="No steps found")
+        return [dict(r) for r in rows]
+
+    @app.get("/api/analysis-steps/{date}/{repo_owner}/{repo_name}/{step}")
+    async def get_analysis_step_detail(date: str, repo_owner: str, repo_name: str, step: str):
+        """返回指定步骤详情"""
+        full_name = f"{repo_owner}/{repo_name}"
+        with get_db(_db_path) as conn:
+            row = conn.execute("""
+                SELECT * FROM analysis_steps
+                WHERE report_date = ? AND repo_full_name = ? AND step_name = ?
+            """, (date, full_name, step)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Step not found")
+        return dict(row)
 
     # ── 数据读取 API ──────────────────────────────────────────────────────────────
 
@@ -978,6 +1091,56 @@ def get_dashboard_html() -> str:
         .webhook-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
         .webhook-item span { flex: 1; font-size: 13px; color: #a9b1d6; word-break: break-all; }
 
+        /* ── Workflow DAG ── */
+        .workflow-dag-container { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; padding: 24px 20px; overflow-x: auto; }
+        .workflow-dag { display: flex; gap: 32px; align-items: flex-start; min-width: fit-content; }
+        .workflow-col { display: flex; flex-direction: column; gap: 10px; }
+        .workflow-col-label { font-size: 10px; color: #565f89; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; text-align: center; }
+        .workflow-node {
+            background: #1e2030; border: 1px solid #2a2d3e; border-radius: 6px;
+            padding: 10px 14px; min-width: 160px; cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+            position: relative;
+        }
+        .workflow-node:hover { border-color: #7aa2f7; background: rgba(122,162,247,0.06); }
+        .workflow-node.status-pending { border-color: #2a2d3e; }
+        .workflow-node.status-running {
+            border-color: #7aa2f7;
+            animation: node-pulse 1.5s ease-in-out infinite;
+        }
+        .workflow-node.status-done { border-color: #9ece6a; background: rgba(158,206,106,0.06); }
+        .workflow-node.status-error { border-color: #f7768e; }
+        @keyframes node-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(122,162,247,0.3); }
+            50% { box-shadow: 0 0 0 6px rgba(122,162,247,0); }
+        }
+        .node-name { font-size: 12px; color: #e0e2f0; font-weight: 500; }
+        .node-analyst { font-size: 10px; color: #565f89; margin-top: 2px; }
+        .node-status-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+        .node-status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+        .status-pending .node-status-dot { background: #565f89; }
+        .status-running .node-status-dot { background: #7aa2f7; animation: blink 0.8s ease-in-out infinite; }
+        .status-done .node-status-dot { background: #9ece6a; }
+        .status-error .node-status-dot { background: #f7768e; }
+        .node-status-text { font-size: 10px; color: #565f89; }
+        .node-duration { font-size: 10px; color: #9ece6a; }
+        .node-model { font-size: 10px; color: #bb9af7; margin-top: 2px; }
+        .workflow-arrow {
+            display: flex; align-items: center; color: #2a2d3e;
+            font-size: 20px; padding-top: 40px; flex-shrink: 0;
+        }
+        .workflow-arrow-big {
+            display: flex; align-items: center; color: #2a2d3e;
+            font-size: 28px; padding-top: 0; align-self: center; flex-shrink: 0;
+        }
+        .workflow-node-tooltip {
+            display: none; position: absolute; left: 100%; top: 0; margin-left: 12px;
+            background: #1e1e2e; border: 1px solid #2a2d3e; border-radius: 6px;
+            padding: 10px 14px; width: 280px; font-size: 11px; color: #a9b1d6;
+            line-height: 1.5; z-index: 100; white-space: pre-wrap; word-break: break-word;
+        }
+        .workflow-node:hover .workflow-node-tooltip { display: block; }
+
         /* ── Modal ── */
         .modal-overlay {
             display: none; position: fixed; inset: 0;
@@ -1026,7 +1189,7 @@ def get_dashboard_html() -> str:
             <div class="tab active" onclick="switchTab('overview')">概览</div>
             <div class="tab" onclick="switchTab('reports')">日报</div>
             <div class="tab" onclick="switchTab('trends')">趋势</div>
-            <div class="tab" onclick="switchTab('agents')">Agents</div>
+            <div class="tab" onclick="switchTab('workflow')">Workflow</div>
             <div class="tab" onclick="switchTab('settings')">Settings</div>
         </div>
 
@@ -1060,9 +1223,31 @@ def get_dashboard_html() -> str:
             <div id="trends-content" class="loading">加载中...</div>
         </div>
 
-        <!-- Agents -->
-        <div id="tab-agents" class="tab-content">
-            <div id="agents-content" class="loading">加载中...</div>
+        <!-- Workflow -->
+        <div id="tab-workflow" class="tab-content">
+            <div id="workflow-content">
+                <div id="workflow-dag" class="workflow-dag-container">
+                    <div class="loading">加载中...</div>
+                </div>
+                <div id="workflow-agents-section" style="margin-top: 24px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; cursor:pointer;" onclick="toggleAgentsSection()">
+                        <div class="section-title" style="margin:0;">分析师配置</div>
+                        <span id="agents-toggle-icon" style="color:#565f89; font-size:13px;">▼ 展开</span>
+                    </div>
+                    <div id="agents-content" style="display:none;" class="loading">加载中...</div>
+                </div>
+            </div>
+            <!-- Step detail panel -->
+            <div id="step-panel" style="display:none; position:fixed; right:0; top:0; bottom:0; width:480px; background:#1e1e2e; border-left:1px solid #2a2d3e; z-index:200; overflow-y:auto; padding:24px; box-shadow:-4px 0 20px rgba(0,0,0,0.4);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <div>
+                        <div id="step-panel-title" style="font-size:16px; color:#e0e2f0; font-weight:600;"></div>
+                        <div id="step-panel-meta" style="font-size:12px; color:#565f89; margin-top:3px;"></div>
+                    </div>
+                    <button onclick="closeStepPanel()" style="background:none; border:none; color:#565f89; font-size:20px; cursor:pointer; padding:4px 8px;">✕</button>
+                </div>
+                <div id="step-panel-content" class="md-content"></div>
+            </div>
         </div>
 
         <!-- Settings -->
@@ -1117,11 +1302,11 @@ def get_dashboard_html() -> str:
         }
 
         function switchTab(name) {
-            const names = ['overview', 'reports', 'trends', 'agents', 'settings'];
+            const names = ['overview', 'reports', 'trends', 'workflow', 'settings'];
             document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', names[i] === name));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById(`tab-${name}`).classList.add('active');
-            if (name === 'agents') loadAgents();
+            if (name === 'workflow') { loadWorkflow(); loadAgents(); }
             if (name === 'settings') loadSettings();
         }
 
@@ -1642,6 +1827,270 @@ def get_dashboard_html() -> str:
             renderPRChart(mode);
         }
 
+        // ── Workflow DAG ────────────────────────────────────────────────────────────
+
+        let _workflowStepStates = {};   // {step_key: {status, duration_s}}
+        let _workflowRepos = [];
+        let _workflowDate = null;
+        let _agentPrompts = {};         // {analyst_id: prompt_text}
+
+        async function loadWorkflow() {
+            // Load repos and determine current date
+            const reposData = await fetchJSON('api/repos').catch(() => []);
+            _workflowRepos = reposData;
+
+            // Load latest available step data
+            const reportsData = await fetchJSON('api/reports?days=7').catch(() => []);
+            const dates = [...new Set(reportsData.map(r => r.report_date))].sort().reverse();
+            _workflowDate = dates[0] || null;
+
+            // Load step states if date available
+            if (_workflowDate) {
+                const steps = await fetchJSON(`api/analysis-steps/${_workflowDate}`).catch(() => []);
+                _workflowStepStates = {};
+                for (const s of steps) {
+                    const key = `${s.repo_full_name}/${s.step_name}`;
+                    _workflowStepStates[key] = { status: 'done', duration_s: s.duration_s, model: s.model };
+                }
+            }
+
+            // Load agent prompts for tooltips
+            const agents = await fetchJSON('api/agents').catch(() => []);
+            _agentPrompts = {};
+            for (const a of agents) {
+                _agentPrompts[a.id] = a.content || '';
+            }
+
+            renderWorkflowDAG();
+        }
+
+        function getStepState(repoFullName, stepName) {
+            const key = `${repoFullName}/${stepName}`;
+            return _workflowStepStates[key] || { status: 'pending', duration_s: null, model: null };
+        }
+
+        function getStepStateFromWS(repoDisplayName, stepName) {
+            // Try to find by display name pattern from WS events
+            for (const [k, v] of Object.entries(_workflowStepStates)) {
+                if (k.includes(repoDisplayName) || k.includes(stepName)) return v;
+            }
+            return { status: 'pending', duration_s: null, model: null };
+        }
+
+        function renderWorkflowNode(repo, stepName, analystId, analystLabel, model) {
+            const fullName = repo.full_name;
+            const state = getStepState(fullName, stepName);
+            const statusClass = `status-${state.status}`;
+            const promptSnippet = (_agentPrompts[analystId] || '').slice(0, 200).replace(/"/g, '&quot;');
+            const durationHtml = state.duration_s ? `<span class="node-duration">${state.duration_s}s</span>` : '';
+            const modelHtml = (state.model || model) ? `<div class="node-model">${state.model || model}</div>` : '';
+            const nodeId = `node-${fullName.replace(/\//g, '-')}-${stepName}`;
+            const statusLabel = state.status === 'pending' ? '待执行' : state.status === 'running' ? '执行中...' : state.status === 'done' ? '完成' : '出错';
+
+            return `<div class="workflow-node ${statusClass}" id="${nodeId}"
+                        onclick="openStepPanel('${fullName}', '${stepName}', '${analystLabel}')"
+                        title="">
+                <div class="node-name">${repo.display_name}/${stepName}</div>
+                <div class="node-analyst">${analystLabel}</div>
+                <div class="node-status-row">
+                    <span class="node-status-dot"></span>
+                    <span class="node-status-text">${statusLabel}</span>
+                    ${durationHtml}
+                </div>
+                ${modelHtml}
+                <div class="workflow-node-tooltip">${promptSnippet}${promptSnippet.length >= 200 ? '...' : ''}</div>
+            </div>`;
+        }
+
+        function renderWorkflowDAG() {
+            if (!_workflowRepos.length) {
+                document.getElementById('workflow-dag').innerHTML = '<div class="loading" style="color:#565f89;">暂无项目</div>';
+                return;
+            }
+
+            const dimModel = 'haiku-4-5';
+            const synModel = 'sonnet-4-6';
+
+            const stepDefs = [
+                { name: 'issues',  analystId: 'issues',    label: '用户研究分析师' },
+                { name: 'prs',     analystId: 'prs',       label: '社区生态分析师' },
+                { name: 'commits', analystId: 'commits',   label: '工程方向分析师' },
+                { name: 'main',    analystId: 'commits',   label: '版本节奏分析师' },
+            ];
+
+            let html = '<div class="workflow-dag">';
+
+            for (const repo of _workflowRepos) {
+                // Column: dimension nodes
+                html += '<div class="workflow-col">';
+                html += `<div class="workflow-col-label">${repo.display_name}</div>`;
+                for (const step of stepDefs) {
+                    html += renderWorkflowNode(repo, step.name, step.analystId, step.label, dimModel);
+                }
+                html += '</div>';
+                html += '<div class="workflow-arrow">→</div>';
+
+                // Synthesis node for this repo (not in DB as a step currently, show as pending placeholder)
+                const synthState = _workflowStepStates[`${repo.full_name}/synthesis`] || { status: 'pending', duration_s: null };
+                const synthStatus = synthState.status === 'done' ? 'done' : 'pending';
+                html += `<div class="workflow-col" style="justify-content:center;">
+                    <div class="workflow-col-label">合成</div>
+                    <div class="workflow-node status-${synthStatus}" style="align-self:center; margin-top:30px;"
+                         onclick="openStepPanel('${repo.full_name}', 'synthesis', '综合分析师')">
+                        <div class="node-name">${repo.display_name} 合成</div>
+                        <div class="node-analyst">综合分析师</div>
+                        <div class="node-status-row">
+                            <span class="node-status-dot"></span>
+                            <span class="node-status-text">${synthStatus === 'done' ? '完成' : '待执行'}</span>
+                        </div>
+                        <div class="node-model">${synModel}</div>
+                    </div>
+                </div>`;
+                html += '<div class="workflow-arrow-big">→</div>';
+            }
+
+            // Global synthesis
+            const globalState = _workflowStepStates['__global__/synthesis'] || { status: 'pending', duration_s: null };
+            const globalStatus = globalState.status;
+            html += `<div class="workflow-col" style="justify-content:center;">
+                <div class="workflow-col-label">全局</div>
+                <div class="workflow-node status-${globalStatus}" style="align-self:center; min-width:140px;"
+                     onclick="openGlobalStepPanel()">
+                    <div class="node-name">全局综合</div>
+                    <div class="node-analyst">综合分析师</div>
+                    <div class="node-status-row">
+                        <span class="node-status-dot"></span>
+                        <span class="node-status-text">${globalStatus === 'done' ? '完成' : globalStatus === 'running' ? '执行中...' : '待执行'}</span>
+                        ${globalState.duration_s ? `<span class="node-duration">${globalState.duration_s}s</span>` : ''}
+                    </div>
+                    <div class="node-model">${synModel}</div>
+                </div>
+            </div>`;
+
+            html += '</div>'; // .workflow-dag
+            document.getElementById('workflow-dag').innerHTML = html;
+        }
+
+        async function openStepPanel(repoFullName, stepName, analystLabel) {
+            const panel = document.getElementById('step-panel');
+            const titleEl = document.getElementById('step-panel-title');
+            const metaEl = document.getElementById('step-panel-meta');
+            const contentEl = document.getElementById('step-panel-content');
+
+            titleEl.textContent = `${repoFullName} / ${stepName}`;
+            metaEl.textContent = analystLabel;
+            contentEl.innerHTML = '<div class="loading">加载中...</div>';
+            panel.style.display = 'block';
+
+            // Try to load from analysis_steps API
+            if (!_workflowDate) { contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>'; return; }
+            const [owner, name] = repoFullName.split('/');
+            try {
+                const step = await fetchJSON(`api/analysis-steps/${_workflowDate}/${owner}/${name}/${stepName}`);
+                const durationStr = step.duration_s ? ` · ${step.duration_s.toFixed(1)}s` : '';
+                const modelStr = step.model ? ` · ${step.model}` : '';
+                metaEl.textContent = `${analystLabel}${durationStr}${modelStr}`;
+                contentEl.innerHTML = marked.parse(step.content || '');
+            } catch (e) {
+                // Fallback: show repo report
+                try {
+                    const rep = await fetchJSON(`api/report/${_workflowDate}?repo=${encodeURIComponent(repoFullName)}`);
+                    contentEl.innerHTML = marked.parse(rep.content || '（暂无数据）');
+                } catch {
+                    contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>';
+                }
+            }
+        }
+
+        async function openGlobalStepPanel() {
+            const panel = document.getElementById('step-panel');
+            const titleEl = document.getElementById('step-panel-title');
+            const metaEl = document.getElementById('step-panel-meta');
+            const contentEl = document.getElementById('step-panel-content');
+
+            titleEl.textContent = '全局综合分析';
+            metaEl.textContent = '综合分析师';
+            contentEl.innerHTML = '<div class="loading">加载中...</div>';
+            panel.style.display = 'block';
+
+            if (!_workflowDate) { contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>'; return; }
+            try {
+                const rep = await fetchJSON(`api/report/${_workflowDate}`);
+                contentEl.innerHTML = marked.parse(rep.content || '（暂无数据）');
+            } catch {
+                contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>';
+            }
+        }
+
+        function closeStepPanel() {
+            document.getElementById('step-panel').style.display = 'none';
+        }
+
+        function toggleAgentsSection() {
+            const el = document.getElementById('agents-content');
+            const icon = document.getElementById('agents-toggle-icon');
+            if (el.style.display === 'none') {
+                el.style.display = 'block';
+                icon.textContent = '▲ 收起';
+                loadAgents();
+            } else {
+                el.style.display = 'none';
+                icon.textContent = '▼ 展开';
+            }
+        }
+
+        // Handle WS workflow events to update DAG in real-time
+        function handleWorkflowEvent(eventType, data) {
+            if (eventType === 'workflow_start') {
+                _workflowStepStates = {};
+                renderWorkflowDAG();
+            } else if (eventType === 'step_start') {
+                const step = data.step || '';
+                _workflowStepStates[step] = { status: 'running', duration_s: null };
+                updateNodeStatus(step, 'running', null);
+            } else if (eventType === 'step_done') {
+                const step = data.step || '';
+                _workflowStepStates[step] = { status: 'done', duration_s: data.duration_s };
+                updateNodeStatus(step, 'done', data.duration_s);
+            } else if (eventType === 'report_ready') {
+                // Refresh workflow to show final state
+                loadWorkflow();
+            }
+        }
+
+        function updateNodeStatus(stepKey, status, durationS) {
+            // Try to find node by step key pattern
+            // step key format: "RepoDisplayName/stepname" or "__global__/synthesis"
+            document.querySelectorAll('.workflow-node').forEach(node => {
+                const nodeId = node.id || '';
+                // Match based on content
+                const nameDivs = node.querySelectorAll('.node-name');
+                nameDivs.forEach(nd => {
+                    const text = nd.textContent.toLowerCase();
+                    const keyLower = stepKey.toLowerCase();
+                    if (keyLower.includes(text.split('/')[0]?.toLowerCase()) ||
+                        text.toLowerCase().includes(stepKey.split('/').pop())) {
+                        // Update status class
+                        node.classList.remove('status-pending', 'status-running', 'status-done', 'status-error');
+                        node.classList.add(`status-${status}`);
+                        // Update status text
+                        const statusTextEl = node.querySelector('.node-status-text');
+                        if (statusTextEl) statusTextEl.textContent = status === 'running' ? '执行中...' : status === 'done' ? '完成' : status;
+                        // Update duration
+                        if (durationS && status === 'done') {
+                            const durationEl = node.querySelector('.node-duration');
+                            if (durationEl) {
+                                durationEl.textContent = `${durationS}s`;
+                            } else {
+                                const row = node.querySelector('.node-status-row');
+                                if (row) row.insertAdjacentHTML('beforeend', `<span class="node-duration">${durationS}s</span>`);
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
         // ── Agents ─────────────────────────────────────────────────────────────────
 
         let _agentsData = [];
@@ -1947,19 +2396,24 @@ websocat -v ${wsUrl}`;
                 _ws.onmessage = (e) => {
                     try {
                         const msg = JSON.parse(e.data);
+                        const activeTab = document.querySelector('.tab.active');
+                        const tabName = activeTab ? (activeTab.getAttribute('onclick').match(/switchTab\('(.+?)'\)/)?.[1] || '') : '';
+
+                        // Handle workflow events
+                        if (['workflow_start', 'step_start', 'step_done'].includes(msg.type)) {
+                            if (tabName === 'workflow') handleWorkflowEvent(msg.type, msg.data);
+                        }
+
                         if (msg.type === 'report_ready') {
                             console.log('[ws] 收到 report_ready，刷新数据...');
+                            if (tabName === 'workflow') handleWorkflowEvent(msg.type, msg.data);
                             // 自动刷新当前 tab 数据
-                            const activeTab = document.querySelector('.tab.active');
-                            if (activeTab) {
-                                const tabName = activeTab.getAttribute('onclick').match(/switchTab\('(.+?)'\)/)?.[1];
-                                if (tabName === 'overview' || !tabName) {
-                                    loadOverview(); loadTodayInsight();
-                                } else if (tabName === 'reports') {
-                                    loadReportDates();
-                                } else if (tabName === 'trends') {
-                                    loadTrends();
-                                }
+                            if (tabName === 'overview' || !tabName) {
+                                loadOverview(); loadTodayInsight();
+                            } else if (tabName === 'reports') {
+                                loadReportDates();
+                            } else if (tabName === 'trends') {
+                                loadTrends();
                             }
                             // 无论如何都刷新概览数据（后台）
                             loadOverview();

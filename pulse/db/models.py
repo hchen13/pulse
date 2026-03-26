@@ -136,6 +136,22 @@ def init_db(db_path: str = None):
         )
     """)
 
+    # 分析步骤中间结果表
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT NOT NULL,
+            repo_full_name TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            analyst TEXT NOT NULL,
+            model TEXT,
+            content TEXT NOT NULL,
+            duration_s REAL,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(report_date, repo_full_name, step_name)
+        )
+    """)
+
     conn.commit()
     conn.close()
 

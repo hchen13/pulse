@@ -33,10 +33,33 @@ class ScheduleConfig:
 
 
 @dataclass
+class ModelsConfig:
+    dimension: str = ""   # for issues/prs/commits
+    synthesis: str = ""   # for repo synthesis + global synthesis
+
+
+@dataclass
 class AnalysisConfig:
     claude_bin: str = "claude"
     model: str = "claude-haiku-4-5"
     max_tokens: int = 2000
+    models: ModelsConfig = None
+
+    def __post_init__(self):
+        if self.models is None:
+            self.models = ModelsConfig()
+
+    def get_dimension_model(self) -> str:
+        """Get model for dimension analysis (issues/prs/commits)"""
+        if self.models and self.models.dimension:
+            return self.models.dimension
+        return self.model
+
+    def get_synthesis_model(self) -> str:
+        """Get model for synthesis (repo + global)"""
+        if self.models and self.models.synthesis:
+            return self.models.synthesis
+        return self.model
 
 
 @dataclass
@@ -125,10 +148,16 @@ def load_config(config_path: Optional[str] = None) -> PulseConfig:
 
     # 解析 analysis
     anal_raw = raw.get("analysis", {})
+    models_raw = anal_raw.get("models", {})
+    models_cfg = ModelsConfig(
+        dimension=models_raw.get("dimension", ""),
+        synthesis=models_raw.get("synthesis", ""),
+    )
     analysis = AnalysisConfig(
         claude_bin=anal_raw.get("claude_bin", "claude"),
         model=anal_raw.get("model", "claude-haiku-4-5"),
         max_tokens=anal_raw.get("max_tokens", 2000),
+        models=models_cfg,
     )
 
     # 解析 notification
