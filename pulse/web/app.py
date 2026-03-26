@@ -186,10 +186,16 @@ def _run_full_cycle():
             _run_status["steps"] = []
             _run_status["current_step"] = None
 
+        # 清除当天旧的 analysis_steps（重新跑时覆盖）
+        today = datetime.now().strftime("%Y-%m-%d")
+        with get_db(cfg.storage.db_path) as conn:
+            conn.execute("DELETE FROM analysis_steps WHERE report_date = ?", (today,))
+            conn.execute("DELETE FROM reports WHERE report_date = ?", (today,))
+
         broadcast_event("workflow_start", {
             "run_id": run_id,
             "total_steps": total_steps,
-            "date": datetime.now().strftime("%Y-%m-%d"),
+            "date": today,
         })
 
         # Wrapper: intercept step_start/step_done to update _run_status
@@ -2146,10 +2152,14 @@ def get_dashboard_html() -> str:
                         </div>`;
                     const sortedFetch = [...fetchSteps].sort((a, b) => (a.duration_s || 999) - (b.duration_s || 999));
                     sortedFetch.forEach((step, i) => {
-                        // Adapt fetch step to look like analysis step for rendering
+                        // Adapt fetch step for rendering
+                        const stepName = step.step_name || step.name || '';
+                        const repoName = stepName.startsWith('fetch/') 
+                            ? stepName.replace('fetch/', '')  // live WS event
+                            : step.repo_full_name;            // DB record
                         const adapted = {
                             ...step,
-                            repo_full_name: (step.step_name || step.name || '').replace('fetch/', ''),
+                            repo_full_name: repoName,
                             step_name: 'fetch',
                             model: '—',
                         };
