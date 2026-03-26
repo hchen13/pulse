@@ -584,6 +584,43 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 ]
             return status
 
+    # ── Workflow Timeline API ───────────────────────────────────────────────────
+
+    @app.get("/api/workflow/latest")
+    async def get_workflow_latest():
+        """返回最近一次分析运行的时间线数据（用于 Workflow tab）"""
+        with get_db(_db_path) as conn:
+            # 找最新的 report_date
+            date_row = conn.execute("""
+                SELECT MAX(report_date) as latest_date FROM analysis_steps
+            """).fetchone()
+            if not date_row or not date_row["latest_date"]:
+                return {"date": None, "steps": [], "total_s": None}
+            latest_date = date_row["latest_date"]
+
+            # 读取该日期所有步骤，按 created_at 排序（完成时间）
+            rows = conn.execute("""
+                SELECT repo_full_name, step_name, analyst, model, duration_s, created_at
+                FROM analysis_steps
+                WHERE report_date = ?
+                ORDER BY created_at ASC
+            """, (latest_date,)).fetchall()
+
+        steps = [dict(r) for r in rows]
+        # 计算总耗时（最后完成 - 最早完成 + 最后步骤自身耗时？
+        # 更准确：max(created_at) 对应的步骤完成时间，但没有 started_at
+        # 用总耗时 = 所有步骤耗时（并行段取最大值）估算
+        # 简化：直接返回 sum，前端可以用 status bar 的 elapsed_s
+        total_s = None
+        if steps:
+            total_s = round(sum(s["duration_s"] or 0 for s in steps), 0)
+
+        return {
+            "date": latest_date,
+            "steps": steps,
+            "total_s": total_s,
+        }
+
     # ── Analysis Steps API ──────────────────────────────────────────────────────
 
     @app.get("/api/analysis-steps/{date}")
@@ -848,8 +885,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     return app
 
 
+
+
 def get_dashboard_html() -> str:
-    """返回 Dashboard 的 HTML（TokyoNight 暗色风格）"""
+    """返回 Dashboard 的 HTML（TokyoNight 暗色风格，navbar 集成 tabs）"""
     return r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -860,7 +899,6 @@ def get_dashboard_html() -> str:
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', sans-serif;
             background: #1a1b26;
@@ -870,21 +908,27 @@ def get_dashboard_html() -> str:
             line-height: 1.6;
         }
 
-        /* ── Header ── */
+        /* ── Navbar (with integrated tabs) ── */
         header {
             background: #16161e;
             border-bottom: 1px solid #2a2d3e;
-            padding: 14px 28px;
+            padding: 0 28px;
             display: flex;
             align-items: center;
-            gap: 14px;
+            gap: 0;
             position: sticky;
             top: 0;
             z-index: 100;
+            height: 52px;
         }
-        .header-left { display: flex; align-items: center; gap: 14px; flex: 1; }
-        header h1 { font-size: 18px; font-weight: 700; color: #7aa2f7; letter-spacing: 0.3px; }
-        header .subtitle { font-size: 12px; color: #565f89; }
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+            margin-right: 24px;
+        }
+        .header-brand h1 { font-size: 17px; font-weight: 700; color: #7aa2f7; letter-spacing: 0.3px; }
         .pulse-dot {
             width: 7px; height: 7px; border-radius: 50%; background: #9ece6a;
             display: inline-block; flex-shrink: 0;
@@ -892,8 +936,38 @@ def get_dashboard_html() -> str:
         }
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
-        /* ── Header action buttons ── */
-        .header-actions { display: flex; gap: 10px; align-items: center; }
+        /* ── Navbar tabs ── */
+        .navbar-tabs {
+            display: flex;
+            align-items: stretch;
+            flex: 1;
+            height: 100%;
+        }
+        .nav-tab {
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #565f89;
+            border-bottom: 2px solid transparent;
+            transition: color 0.15s, border-color 0.15s;
+            white-space: nowrap;
+            user-select: none;
+        }
+        .nav-tab:hover { color: #a9b1d6; }
+        .nav-tab.active { color: #7aa2f7; border-bottom-color: #7aa2f7; font-weight: 500; }
+
+        /* ── Header right ── */
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+            margin-left: 16px;
+        }
+
+        /* ── Buttons ── */
         .btn {
             display: inline-flex; align-items: center; gap: 6px;
             padding: 7px 14px; border-radius: 6px; font-size: 13px;
@@ -918,7 +992,7 @@ def get_dashboard_html() -> str:
         .btn-sm { padding: 4px 10px; font-size: 12px; }
         .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-        /* ── Run status bar ── */
+        /* ── Run statusbar ── */
         #run-statusbar {
             background: rgba(158,206,106,0.08);
             border-bottom: 1px solid rgba(158,206,106,0.2);
@@ -933,17 +1007,9 @@ def get_dashboard_html() -> str:
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
         /* ── Layout ── */
-        .container { max-width: 1100px; margin: 0 auto; padding: 24px 28px; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px 28px; }
 
-        /* ── Tabs ── */
-        .tabs { display: flex; gap: 2px; margin-bottom: 24px; border-bottom: 1px solid #2a2d3e; }
-        .tab {
-            padding: 8px 18px; cursor: pointer; font-size: 13px; color: #565f89;
-            border-bottom: 2px solid transparent; margin-bottom: -1px;
-            transition: color 0.15s, border-color 0.15s;
-        }
-        .tab:hover { color: #a9b1d6; }
-        .tab.active { color: #7aa2f7; border-bottom-color: #7aa2f7; font-weight: 500; }
+        /* ── Tab content ── */
         .tab-content { display: none; }
         .tab-content.active { display: block; }
 
@@ -987,8 +1053,7 @@ def get_dashboard_html() -> str:
         .report-block-title {
             font-size: 13px; color: #565f89; text-transform: uppercase;
             letter-spacing: 0.8px; margin-bottom: 16px; padding-bottom: 10px;
-            border-bottom: 1px solid #2a2d3e; font-weight: 500;
-            text-align: left;
+            border-bottom: 1px solid #2a2d3e; font-weight: 500; text-align: left;
         }
 
         /* ── Markdown content ── */
@@ -1043,6 +1108,71 @@ def get_dashboard_html() -> str:
         .pr-toggle-btn:hover { background: #1e1e2e; color: #a9b1d6; }
         .pr-toggle-btn.active { background: #2a2d3e; color: #7aa2f7; font-weight: 600; }
 
+        /* ── Workflow Timeline ── */
+        .workflow-container { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; padding: 24px; }
+        .workflow-header {
+            display: flex; align-items: baseline; gap: 16px;
+            margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid #2a2d3e;
+        }
+        .workflow-header .run-date { font-size: 15px; color: #e0e2f0; font-weight: 600; }
+        .workflow-header .run-total { font-size: 12px; color: #565f89; }
+        .phase-block { margin-bottom: 20px; }
+        .phase-label {
+            display: flex; align-items: center; justify-content: space-between;
+            font-size: 11px; color: #565f89; text-transform: uppercase;
+            letter-spacing: 0.8px; margin-bottom: 8px; font-weight: 600;
+        }
+        .phase-label .phase-duration { font-size: 11px; color: #7aa2f7; font-weight: 500; }
+        .timeline-item {
+            display: flex;
+            align-items: center;
+            padding: 6px 10px;
+            border-radius: 5px;
+            margin-bottom: 3px;
+            cursor: pointer;
+            transition: background 0.12s;
+            gap: 8px;
+        }
+        .timeline-item:hover { background: rgba(122,162,247,0.07); }
+        .timeline-item.active { background: rgba(122,162,247,0.12); }
+        .tl-icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 13px; }
+        .tl-icon.done { color: #9ece6a; }
+        .tl-icon.running { color: #7aa2f7; animation: blink 0.8s ease-in-out infinite; }
+        .tl-icon.pending { color: #414868; }
+        .tl-icon.error { color: #f7768e; }
+        .tl-name {
+            font-size: 13px; color: #cdd6f4; flex: 1;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tl-leader {
+            flex: 0 1 120px;
+            font-size: 11px; color: #2a2d3e; letter-spacing: 2px;
+            overflow: hidden; text-overflow: clip; white-space: nowrap;
+            text-align: right;
+        }
+        .tl-duration {
+            font-size: 12px; color: #7aa2f7; flex-shrink: 0;
+            min-width: 36px; text-align: right; font-variant-numeric: tabular-nums;
+        }
+        .tl-model {
+            font-size: 11px; color: #565f89; flex-shrink: 0;
+            margin-left: 6px; min-width: 44px; text-align: right;
+        }
+        .workflow-footer {
+            margin-top: 16px; padding-top: 14px; border-top: 1px solid #2a2d3e;
+            font-size: 12px; color: #565f89; display: flex; gap: 16px; align-items: center;
+        }
+        .workflow-footer strong { color: #a9b1d6; }
+
+        /* ── Step detail panel (side drawer) ── */
+        #step-panel {
+            display: none; position: fixed; right: 0; top: 0; bottom: 0;
+            width: 480px; background: #1e1e2e;
+            border-left: 1px solid #2a2d3e; z-index: 200;
+            overflow-y: auto; padding: 24px;
+            box-shadow: -4px 0 20px rgba(0,0,0,0.4);
+        }
+
         /* ── Agent cards ── */
         .agent-card { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
         .agent-card-header {
@@ -1091,55 +1221,14 @@ def get_dashboard_html() -> str:
         .webhook-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
         .webhook-item span { flex: 1; font-size: 13px; color: #a9b1d6; word-break: break-all; }
 
-        /* ── Workflow DAG ── */
-        .workflow-dag-container { background: #16161e; border: 1px solid #2a2d3e; border-radius: 8px; padding: 24px 20px; overflow-x: auto; }
-        .workflow-dag { display: flex; gap: 32px; align-items: flex-start; min-width: fit-content; }
-        .workflow-col { display: flex; flex-direction: column; gap: 10px; }
-        .workflow-col-label { font-size: 10px; color: #565f89; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; text-align: center; }
-        .workflow-node {
-            background: #1e2030; border: 1px solid #2a2d3e; border-radius: 6px;
-            padding: 10px 14px; min-width: 160px; cursor: pointer;
-            transition: border-color 0.15s, background 0.15s;
-            position: relative;
+        /* ── Collapsible agents section ── */
+        .collapsible-header {
+            display: flex; justify-content: space-between; align-items: center;
+            cursor: pointer; padding: 14px 0; user-select: none;
+            border-top: 1px solid #2a2d3e; margin-top: 24px;
         }
-        .workflow-node:hover { border-color: #7aa2f7; background: rgba(122,162,247,0.06); }
-        .workflow-node.status-pending { border-color: #2a2d3e; }
-        .workflow-node.status-running {
-            border-color: #7aa2f7;
-            animation: node-pulse 1.5s ease-in-out infinite;
-        }
-        .workflow-node.status-done { border-color: #9ece6a; background: rgba(158,206,106,0.06); }
-        .workflow-node.status-error { border-color: #f7768e; }
-        @keyframes node-pulse {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(122,162,247,0.3); }
-            50% { box-shadow: 0 0 0 6px rgba(122,162,247,0); }
-        }
-        .node-name { font-size: 12px; color: #e0e2f0; font-weight: 500; }
-        .node-analyst { font-size: 10px; color: #565f89; margin-top: 2px; }
-        .node-status-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
-        .node-status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-        .status-pending .node-status-dot { background: #565f89; }
-        .status-running .node-status-dot { background: #7aa2f7; animation: blink 0.8s ease-in-out infinite; }
-        .status-done .node-status-dot { background: #9ece6a; }
-        .status-error .node-status-dot { background: #f7768e; }
-        .node-status-text { font-size: 10px; color: #565f89; }
-        .node-duration { font-size: 10px; color: #9ece6a; }
-        .node-model { font-size: 10px; color: #bb9af7; margin-top: 2px; }
-        .workflow-arrow {
-            display: flex; align-items: center; color: #2a2d3e;
-            font-size: 20px; padding-top: 40px; flex-shrink: 0;
-        }
-        .workflow-arrow-big {
-            display: flex; align-items: center; color: #2a2d3e;
-            font-size: 28px; padding-top: 0; align-self: center; flex-shrink: 0;
-        }
-        .workflow-node-tooltip {
-            display: none; position: absolute; left: 100%; top: 0; margin-left: 12px;
-            background: #1e1e2e; border: 1px solid #2a2d3e; border-radius: 6px;
-            padding: 10px 14px; width: 280px; font-size: 11px; color: #a9b1d6;
-            line-height: 1.5; z-index: 100; white-space: pre-wrap; word-break: break-word;
-        }
-        .workflow-node:hover .workflow-node-tooltip { display: block; }
+        .collapsible-header:hover .section-title { color: #7aa2f7; }
+        .collapsible-icon { font-size: 12px; color: #565f89; }
 
         /* ── Modal ── */
         .modal-overlay {
@@ -1166,15 +1255,20 @@ def get_dashboard_html() -> str:
     </style>
 </head>
 <body>
+    <!-- Navbar with integrated tabs -->
     <header>
-        <div class="header-left">
+        <div class="header-brand">
             <span class="pulse-dot"></span>
-            <div>
-                <h1>Pulse</h1>
-                <div class="subtitle">持续感知 AI agent 工具生态的前沿动态</div>
-            </div>
+            <h1>Pulse</h1>
         </div>
-        <div class="header-actions">
+        <nav class="navbar-tabs">
+            <div class="nav-tab active" onclick="switchTab('overview')">概览</div>
+            <div class="nav-tab" onclick="switchTab('reports')">日报</div>
+            <div class="nav-tab" onclick="switchTab('trends')">趋势</div>
+            <div class="nav-tab" onclick="switchTab('workflow')">Workflow</div>
+            <div class="nav-tab" onclick="switchTab('settings')">Settings</div>
+        </nav>
+        <div class="header-right">
             <button class="btn btn-primary" id="btn-run" onclick="triggerRun()">立即分析</button>
         </div>
     </header>
@@ -1185,14 +1279,6 @@ def get_dashboard_html() -> str:
     </div>
 
     <div class="container">
-        <div class="tabs">
-            <div class="tab active" onclick="switchTab('overview')">概览</div>
-            <div class="tab" onclick="switchTab('reports')">日报</div>
-            <div class="tab" onclick="switchTab('trends')">趋势</div>
-            <div class="tab" onclick="switchTab('workflow')">Workflow</div>
-            <div class="tab" onclick="switchTab('settings')">Settings</div>
-        </div>
-
         <!-- 概览 -->
         <div id="tab-overview" class="tab-content active">
             <div id="repos-overview" class="loading">加载中...</div>
@@ -1225,28 +1311,18 @@ def get_dashboard_html() -> str:
 
         <!-- Workflow -->
         <div id="tab-workflow" class="tab-content">
-            <div id="workflow-content">
-                <div id="workflow-dag" class="workflow-dag-container">
-                    <div class="loading">加载中...</div>
-                </div>
-                <div id="workflow-agents-section" style="margin-top: 24px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; cursor:pointer;" onclick="toggleAgentsSection()">
-                        <div class="section-title" style="margin:0;">分析师配置</div>
-                        <span id="agents-toggle-icon" style="color:#565f89; font-size:13px;">▼ 展开</span>
-                    </div>
-                    <div id="agents-content" style="display:none;" class="loading">加载中...</div>
-                </div>
+            <!-- Timeline -->
+            <div id="workflow-timeline-wrap">
+                <div class="loading">加载中...</div>
             </div>
-            <!-- Step detail panel -->
-            <div id="step-panel" style="display:none; position:fixed; right:0; top:0; bottom:0; width:480px; background:#1e1e2e; border-left:1px solid #2a2d3e; z-index:200; overflow-y:auto; padding:24px; box-shadow:-4px 0 20px rgba(0,0,0,0.4);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <div>
-                        <div id="step-panel-title" style="font-size:16px; color:#e0e2f0; font-weight:600;"></div>
-                        <div id="step-panel-meta" style="font-size:12px; color:#565f89; margin-top:3px;"></div>
-                    </div>
-                    <button onclick="closeStepPanel()" style="background:none; border:none; color:#565f89; font-size:20px; cursor:pointer; padding:4px 8px;">✕</button>
-                </div>
-                <div id="step-panel-content" class="md-content"></div>
+
+            <!-- Agents config (collapsed) -->
+            <div class="collapsible-header" onclick="toggleAgentsSection()">
+                <div class="section-title" style="margin:0;">分析师配置</div>
+                <span class="collapsible-icon" id="agents-toggle-icon">▼ 展开</span>
+            </div>
+            <div id="agents-content" style="display:none;">
+                <div class="loading">加载中...</div>
             </div>
         </div>
 
@@ -1254,7 +1330,18 @@ def get_dashboard_html() -> str:
         <div id="tab-settings" class="tab-content">
             <div id="settings-content" class="loading">加载中...</div>
         </div>
+    </div>
 
+    <!-- Step detail side panel -->
+    <div id="step-panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <div>
+                <div id="step-panel-title" style="font-size:16px; color:#e0e2f0; font-weight:600;"></div>
+                <div id="step-panel-meta" style="font-size:12px; color:#565f89; margin-top:3px;"></div>
+            </div>
+            <button onclick="closeStepPanel()" style="background:none; border:none; color:#565f89; font-size:20px; cursor:pointer; padding:4px 8px;">✕</button>
+        </div>
+        <div id="step-panel-content" class="md-content"></div>
     </div>
 
     <!-- 添加项目 Modal -->
@@ -1274,6 +1361,17 @@ def get_dashboard_html() -> str:
                 <button class="btn" style="background:#1e1e2e; color:#565f89; border-color:#2a2d3e;" onclick="closeAddRepoModal()">取消</button>
                 <button class="btn btn-success" onclick="submitAddRepo()">添加</button>
             </div>
+        </div>
+    </div>
+
+    <!-- WS API Modal -->
+    <div id="ws-api-modal" class="modal-overlay">
+        <div class="modal" style="width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-shrink:0;">
+                <h3 style="margin:0;">WebSocket API</h3>
+                <button onclick="closeWsApiModal()" style="background:none;border:none;color:#565f89;font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;" title="关闭 (ESC)">✕</button>
+            </div>
+            <div id="ws-api-modal-body" style="overflow-y:auto;flex:1;"></div>
         </div>
     </div>
 
@@ -1303,10 +1401,10 @@ def get_dashboard_html() -> str:
 
         function switchTab(name) {
             const names = ['overview', 'reports', 'trends', 'workflow', 'settings'];
-            document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', names[i] === name));
+            document.querySelectorAll('.nav-tab').forEach((t, i) => t.classList.toggle('active', names[i] === name));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById(`tab-${name}`).classList.add('active');
-            if (name === 'workflow') { loadWorkflow(); loadAgents(); }
+            if (name === 'workflow') { loadWorkflowTimeline(); }
             if (name === 'settings') loadSettings();
         }
 
@@ -1387,21 +1485,26 @@ def get_dashboard_html() -> str:
                         statusbar.style.display = 'none';
                         document.getElementById('btn-run').disabled = false;
                         if (s.result) {
-                            statusText.textContent = s.result;
-                            // 刷新数据
                             await loadOverview();
                             await loadReportDates();
                             await loadTodayInsight();
+                            await loadWorkflowTimeline();
                         }
-                        if (s.error) {
-                            alert(`分析出错: ${s.error}`);
+                        if (s.error) alert(`分析出错: ${s.error}`);
+                    } else {
+                        const elapsed = s.elapsed_s ? `${s.elapsed_s}s` : '';
+                        const progress = s.progress || '';
+                        statusText.textContent = `正在执行 ${progress} ${elapsed}`;
+                        // Update timeline if on workflow tab
+                        const activeTab = document.querySelector('.nav-tab.active');
+                        if (activeTab && activeTab.textContent === 'Workflow') {
+                            loadWorkflowTimeline(true);
                         }
                     }
                 } catch {}
             }, 3000);
         }
 
-        // 页面加载时检查是否有任务在跑
         async function checkRunStatus() {
             try {
                 const s = await fetchJSON('api/run/status');
@@ -1446,7 +1549,6 @@ def get_dashboard_html() -> str:
                     </div>
                 </div>`;
 
-                // 项目列表标题行（含添加按钮）
                 html += `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                     <div class="section-title" style="margin:0;">监控项目</div>
                     <button class="btn btn-success btn-sm" onclick="openAddRepoModal()">+ 添加项目</button>
@@ -1468,22 +1570,10 @@ def get_dashboard_html() -> str:
                             </div>
                         </div>
                         <div class="repo-stats">
-                            <div class="repo-stat">
-                                <div class="num">${r.issues_open}</div>
-                                <div class="label">Open Issues</div>
-                            </div>
-                            <div class="repo-stat">
-                                <div class="num">${r.prs_open}</div>
-                                <div class="label">Open PRs</div>
-                            </div>
-                            <div class="repo-stat">
-                                <div class="num">${r.merged_prs_7d || 0}</div>
-                                <div class="label">Merged PRs</div>
-                            </div>
-                            <div class="repo-stat">
-                                <div class="num">${r.commits_7d}</div>
-                                <div class="label">7日 Commits</div>
-                            </div>
+                            <div class="repo-stat"><div class="num">${r.issues_open}</div><div class="label">Open Issues</div></div>
+                            <div class="repo-stat"><div class="num">${r.prs_open}</div><div class="label">Open PRs</div></div>
+                            <div class="repo-stat"><div class="num">${r.merged_prs_7d || 0}</div><div class="label">Merged PRs</div></div>
+                            <div class="repo-stat"><div class="num">${r.commits_7d}</div><div class="label">7日 Commits</div></div>
                             <div class="repo-stat" style="text-align:left; flex:1; margin-left:16px;">
                                 <div style="font-size:12px; color:#565f89; text-transform:uppercase; letter-spacing:0.5px;">Latest Release</div>
                                 <div style="font-size:13px; margin-top:4px;">${release}</div>
@@ -1521,8 +1611,6 @@ def get_dashboard_html() -> str:
 
                 select.value = dates[0];
                 await loadReport();
-
-
             } catch (e) {
                 document.getElementById('report-date-select').innerHTML = '<option value="">加载失败</option>';
             }
@@ -1583,12 +1671,13 @@ def get_dashboard_html() -> str:
             }
         }
 
-        // ── 趋势颜色方案 ─────────────────────────────────────────────────────────────
+        // ── 趋势 ───────────────────────────────────────────────────────────────────
+
         const TREND_COLORS = [
-            { line: '#7aa2f7', fill: 'rgba(122,162,247,0.12)' },  // blue
-            { line: '#9ece6a', fill: 'rgba(158,206,106,0.12)' },  // green
-            { line: '#ff9e64', fill: 'rgba(255,158,100,0.12)' },  // orange
-            { line: '#bb9af7', fill: 'rgba(187,154,247,0.12)' },  // purple
+            { line: '#7aa2f7', fill: 'rgba(122,162,247,0.12)' },
+            { line: '#9ece6a', fill: 'rgba(158,206,106,0.12)' },
+            { line: '#ff9e64', fill: 'rgba(255,158,100,0.12)' },
+            { line: '#bb9af7', fill: 'rgba(187,154,247,0.12)' },
         ];
 
         function buildDateRange(days) {
@@ -1612,73 +1701,37 @@ def get_dashboard_html() -> str:
             const ctx = document.getElementById(canvasId).getContext('2d');
             if (charts[canvasId]) charts[canvasId].destroy();
 
-            // 判断是否需要双 Y 轴：最大值差距超过 10 倍
             const maxValues = datasets.map(ds => Math.max(...ds.data, 1));
             const globalMax = Math.max(...maxValues);
             const globalMin = Math.min(...maxValues);
             const needDualAxis = globalMax / globalMin > 8 && datasets.length >= 2;
 
-            // 如果需要双轴：数量级最大的放左轴，其余放右轴
             const sortedByMax = [...datasets].sort((a, b) => Math.max(...b.data) - Math.max(...a.data));
             const leftAxisRepos = new Set([sortedByMax[0].label]);
 
             const processedDatasets = datasets.map((ds, i) => {
                 const isLeft = !needDualAxis || leftAxisRepos.has(ds.label);
-                return {
-                    ...ds,
-                    yAxisID: needDualAxis ? (isLeft ? 'yLeft' : 'yRight') : 'y',
-                };
+                return { ...ds, yAxisID: needDualAxis ? (isLeft ? 'yLeft' : 'yRight') : 'y' };
             });
 
             const scales = needDualAxis ? {
-                x: {
-                    ticks: { color: '#565f89', font: { size: 10 }, maxTicksLimit: 7 },
-                    grid: { color: 'rgba(42,45,62,0.8)' }
-                },
-                yLeft: {
-                    position: 'left',
-                    ticks: { color: '#7aa2f7', font: { size: 10 } },
-                    grid: { color: 'rgba(42,45,62,0.8)' },
-                    beginAtZero: true,
-                    title: { display: true, text: sortedByMax[0].label, color: '#7aa2f7', font: { size: 10 } },
-                },
-                yRight: {
-                    position: 'right',
-                    ticks: { color: '#9ece6a', font: { size: 10 } },
-                    grid: { drawOnChartArea: false },
-                    beginAtZero: true,
-                    title: { display: true, text: '其他项目', color: '#9ece6a', font: { size: 10 } },
-                },
+                x: { ticks: { color: '#565f89', font: { size: 10 }, maxTicksLimit: 7 }, grid: { color: 'rgba(42,45,62,0.8)' } },
+                yLeft: { position: 'left', ticks: { color: '#7aa2f7', font: { size: 10 } }, grid: { color: 'rgba(42,45,62,0.8)' }, beginAtZero: true, title: { display: true, text: sortedByMax[0].label, color: '#7aa2f7', font: { size: 10 } } },
+                yRight: { position: 'right', ticks: { color: '#9ece6a', font: { size: 10 } }, grid: { drawOnChartArea: false }, beginAtZero: true, title: { display: true, text: '其他项目', color: '#9ece6a', font: { size: 10 } } },
             } : {
-                x: {
-                    ticks: { color: '#565f89', font: { size: 10 }, maxTicksLimit: 7 },
-                    grid: { color: 'rgba(42,45,62,0.8)' }
-                },
-                y: {
-                    ticks: { color: '#565f89', font: { size: 10 } },
-                    grid: { color: 'rgba(42,45,62,0.8)' },
-                    beginAtZero: true,
-                },
+                x: { ticks: { color: '#565f89', font: { size: 10 }, maxTicksLimit: 7 }, grid: { color: 'rgba(42,45,62,0.8)' } },
+                y: { ticks: { color: '#565f89', font: { size: 10 } }, grid: { color: 'rgba(42,45,62,0.8)' }, beginAtZero: true },
             };
 
             charts[canvasId] = new Chart(ctx, {
                 type: 'line',
                 data: { labels, datasets: processedDatasets },
                 options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
+                    responsive: true, maintainAspectRatio: false,
                     interaction: { mode: 'index', intersect: false },
                     plugins: {
-                        legend: {
-                            display: false,
-                        },
-                        tooltip: {
-                            backgroundColor: '#1e1e2e',
-                            borderColor: '#2a2d3e',
-                            borderWidth: 1,
-                            titleColor: '#e0e2f0',
-                            bodyColor: '#a9b1d6',
-                        }
+                        legend: { display: false },
+                        tooltip: { backgroundColor: '#1e1e2e', borderColor: '#2a2d3e', borderWidth: 1, titleColor: '#e0e2f0', bodyColor: '#a9b1d6' }
                     },
                     scales,
                 }
@@ -1690,14 +1743,11 @@ def get_dashboard_html() -> str:
             repoList.forEach(([fullName, data], i) => {
                 const color = TREND_COLORS[i % TREND_COLORS.length];
                 const owner = fullName.split('/')[0];
-                html += `
-                    <div style="display:flex; align-items:center; gap:6px;">
-                        <img src="https://github.com/${owner}.png?size=20"
-                             style="width:20px; height:20px; border-radius:50%; border:1.5px solid ${color.line};"
-                             onerror="this.style.display='none'">
-                        <span style="width:10px; height:3px; background:${color.line}; border-radius:2px; display:inline-block;"></span>
-                        <span style="font-size:12px; color:#a9b1d6;">${escapeHtml(data.display_name)}</span>
-                    </div>`;
+                html += `<div style="display:flex; align-items:center; gap:6px;">
+                    <img src="https://github.com/${owner}.png?size=20" style="width:20px; height:20px; border-radius:50%; border:1.5px solid ${color.line};" onerror="this.style.display='none'">
+                    <span style="width:10px; height:3px; background:${color.line}; border-radius:2px; display:inline-block;"></span>
+                    <span style="font-size:12px; color:#a9b1d6;">${escapeHtml(data.display_name)}</span>
+                </div>`;
             });
             html += '</div>';
             return html;
@@ -1715,69 +1765,29 @@ def get_dashboard_html() -> str:
                     return;
                 }
 
-                // 三张图：Commits趋势 / Issues趋势 / PR趋势
                 const legendHtml = buildAvatarLegend(repoList);
-
-                // PR 图表有 toggle，其他两张图直接渲染
                 let html = '';
-                // Commits 图
-                html += `<div class="card" style="margin-bottom: 16px;">
-                    <h3 style="margin-bottom: 10px;">Commits 趋势（14天）</h3>
-                    ${legendHtml}
-                    <div style="height: 220px;"><canvas id="chart-commits"></canvas></div>
-                </div>`;
-                // Issues 图
-                html += `<div class="card" style="margin-bottom: 16px;">
-                    <h3 style="margin-bottom: 10px;">Issues 趋势（14天）</h3>
-                    ${legendHtml}
-                    <div style="height: 220px;"><canvas id="chart-issues"></canvas></div>
-                </div>`;
-                // PR 图（带 toggle）
-                html += `<div class="card" style="margin-bottom: 16px;">
-                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
-                        <h3>PR 趋势（14天）</h3>
-                        <div class="pr-toggle-group" id="pr-toggle-group">
-                            <button class="pr-toggle-btn active" data-mode="all" onclick="switchPRMode('all')">All</button>
-                            <button class="pr-toggle-btn" data-mode="open" onclick="switchPRMode('open')">Open</button>
-                            <button class="pr-toggle-btn" data-mode="merged" onclick="switchPRMode('merged')">Merged</button>
-                        </div>
-                    </div>
-                    ${legendHtml}
-                    <div style="height: 220px;"><canvas id="chart-prs"></canvas></div>
-                </div>`;
+                html += `<div class="card" style="margin-bottom: 16px;"><h3 style="margin-bottom: 10px;">Commits 趋势（14天）</h3>${legendHtml}<div style="height: 220px;"><canvas id="chart-commits"></canvas></div></div>`;
+                html += `<div class="card" style="margin-bottom: 16px;"><h3 style="margin-bottom: 10px;">Issues 趋势（14天）</h3>${legendHtml}<div style="height: 220px;"><canvas id="chart-issues"></canvas></div></div>`;
+                html += `<div class="card" style="margin-bottom: 16px;"><div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;"><h3>PR 趋势（14天）</h3><div class="pr-toggle-group" id="pr-toggle-group"><button class="pr-toggle-btn active" data-mode="all" onclick="switchPRMode('all')">All</button><button class="pr-toggle-btn" data-mode="open" onclick="switchPRMode('open')">Open</button><button class="pr-toggle-btn" data-mode="merged" onclick="switchPRMode('merged')">Merged</button></div></div>${legendHtml}<div style="height: 220px;"><canvas id="chart-prs"></canvas></div></div>`;
 
                 document.getElementById('trends-content').innerHTML = html;
 
-                // 缓存 trends 数据供 toggle 使用
                 window._trendsRepoList = repoList;
                 window._trendsDateRange = dateRange;
                 window._trendsDays = days;
                 window._prMode = 'all';
 
-                // 渲染 Commits 和 Issues 图（面积图）
-                ['commits', 'issues'].forEach((dataKey, idx) => {
+                ['commits', 'issues'].forEach((dataKey) => {
                     const canvasId = dataKey === 'commits' ? 'chart-commits' : 'chart-issues';
                     const datasets = repoList.map(([fullName, data], i) => {
                         const color = TREND_COLORS[i % TREND_COLORS.length];
-                        return {
-                            label: data.display_name,
-                            data: fillSeries(dateRange, data[dataKey]),
-                            borderColor: color.line,
-                            backgroundColor: color.fill,
-                            pointBackgroundColor: color.line,
-                            borderWidth: 2,
-                            pointRadius: 3,
-                            pointHoverRadius: 5,
-                            fill: true,
-                            tension: 0.3,
-                        };
+                        return { label: data.display_name, data: fillSeries(dateRange, data[dataKey]), borderColor: color.line, backgroundColor: color.fill, pointBackgroundColor: color.line, borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, fill: true, tension: 0.3 };
                     });
                     makeMultiLineChart(canvasId, dateRange, datasets, days);
                 });
 
-                // 渲染 PR 图（默认 All 模式）
                 renderPRChart('all');
-
             } catch (e) {
                 document.getElementById('trends-content').innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
             }
@@ -1786,237 +1796,303 @@ def get_dashboard_html() -> str:
         function renderPRChart(mode) {
             const repoList = window._trendsRepoList;
             const dateRange = window._trendsDateRange;
-            const days = window._trendsDays;
             if (!repoList) return;
 
             const datasets = repoList.map(([fullName, data], i) => {
                 const color = TREND_COLORS[i % TREND_COLORS.length];
                 let seriesData;
-                if (mode === 'open') {
-                    seriesData = fillSeries(dateRange, data['open_prs']);
-                } else if (mode === 'merged') {
-                    seriesData = fillSeries(dateRange, data['merged_prs']);
-                } else {
-                    // all = open + merged combined
+                if (mode === 'open') seriesData = fillSeries(dateRange, data['open_prs']);
+                else if (mode === 'merged') seriesData = fillSeries(dateRange, data['merged_prs']);
+                else {
                     const openArr = fillSeries(dateRange, data['open_prs']);
                     const mergedArr = fillSeries(dateRange, data['merged_prs']);
                     seriesData = openArr.map((v, idx) => v + mergedArr[idx]);
                 }
-                return {
-                    label: data.display_name,
-                    data: seriesData,
-                    borderColor: color.line,
-                    backgroundColor: color.fill,
-                    pointBackgroundColor: color.line,
-                    borderWidth: 2,
-                    pointRadius: 3,
-                    pointHoverRadius: 5,
-                    fill: true,
-                    tension: 0.3,
-                };
+                return { label: data.display_name, data: seriesData, borderColor: color.line, backgroundColor: color.fill, pointBackgroundColor: color.line, borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, fill: true, tension: 0.3 };
             });
-            makeMultiLineChart('chart-prs', dateRange, datasets, days);
+            makeMultiLineChart('chart-prs', dateRange, datasets, window._trendsDays);
         }
 
         function switchPRMode(mode) {
             window._prMode = mode;
-            // 更新按钮状态
-            document.querySelectorAll('.pr-toggle-btn').forEach(btn => {
-                btn.classList.toggle('active', btn.dataset.mode === mode);
-            });
+            document.querySelectorAll('.pr-toggle-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.mode === mode));
             renderPRChart(mode);
         }
 
-        // ── Workflow DAG ────────────────────────────────────────────────────────────
+        // ── Workflow Timeline ───────────────────────────────────────────────────────
 
-        let _workflowStepStates = {};   // {step_key: {status, duration_s}}
-        let _workflowRepos = [];
-        let _workflowDate = null;
-        let _agentPrompts = {};         // {analyst_id: prompt_text}
+        let _wfDate = null;
+        let _wfSteps = [];       // from API
+        let _wfLiveStates = {};  // from WS: {step_key: {status, duration_s}}
 
-        async function loadWorkflow() {
-            // Load repos and determine current date
-            const reposData = await fetchJSON('api/repos').catch(() => []);
-            _workflowRepos = reposData;
+        // step_key from WS events is "{repo_display_name}/{step_name}" e.g. "claude-code/issues"
+        // step from DB is {repo_full_name, step_name} e.g. "anthropics/claude-code", "issues"
 
-            // Load latest available step data
-            const reportsData = await fetchJSON('api/reports?days=7').catch(() => []);
-            const dates = [...new Set(reportsData.map(r => r.report_date))].sort().reverse();
-            _workflowDate = dates[0] || null;
+        // Map from (repo_full_name, step_name) → step key for WS lookups
+        // We'll maintain a lookup by the DB data's repo display_name
 
-            // Load step states if date available
-            if (_workflowDate) {
-                const steps = await fetchJSON(`api/analysis-steps/${_workflowDate}`).catch(() => []);
-                _workflowStepStates = {};
-                for (const s of steps) {
-                    const key = `${s.repo_full_name}/${s.step_name}`;
-                    _workflowStepStates[key] = { status: 'done', duration_s: s.duration_s, model: s.model };
-                }
-            }
+        let _repoDisplayMap = {};  // full_name → display_name
 
-            // Load agent prompts for tooltips
-            const agents = await fetchJSON('api/agents').catch(() => []);
-            _agentPrompts = {};
-            for (const a of agents) {
-                _agentPrompts[a.id] = a.content || '';
-            }
-
-            renderWorkflowDAG();
+        function fmtSeconds(s) {
+            if (s == null) return '';
+            return Math.round(s) + 's';
         }
 
-        function getStepState(repoFullName, stepName) {
-            const key = `${repoFullName}/${stepName}`;
-            return _workflowStepStates[key] || { status: 'pending', duration_s: null, model: null };
+        function fmtTotalTime(s) {
+            if (s == null) return '';
+            if (s < 60) return `${Math.round(s)}s`;
+            const m = Math.floor(s / 60);
+            const sec = Math.round(s % 60);
+            return `${m}m${sec}s`;
         }
 
-        function getStepStateFromWS(repoDisplayName, stepName) {
-            // Try to find by display name pattern from WS events
-            for (const [k, v] of Object.entries(_workflowStepStates)) {
-                if (k.includes(repoDisplayName) || k.includes(stepName)) return v;
-            }
-            return { status: 'pending', duration_s: null, model: null };
+        function fmtModel(m) {
+            if (!m) return '';
+            // Shorten model names
+            if (m.includes('haiku')) return 'haiku';
+            if (m.includes('sonnet')) return 'sonnet';
+            if (m.includes('opus')) return 'opus';
+            return m.split('-').slice(0, 2).join('-');
         }
 
-        function renderWorkflowNode(repo, stepName, analystId, analystLabel, model) {
-            const fullName = repo.full_name;
-            const state = getStepState(fullName, stepName);
-            const statusClass = `status-${state.status}`;
-            const promptSnippet = (_agentPrompts[analystId] || '').slice(0, 200).replace(/"/g, '&quot;');
-            const durationHtml = state.duration_s ? `<span class="node-duration">${state.duration_s}s</span>` : '';
-            const modelHtml = (state.model || model) ? `<div class="node-model">${state.model || model}</div>` : '';
-            const nodeId = `node-${fullName.replace(/\//g, '-')}-${stepName}`;
-            const statusLabel = state.status === 'pending' ? '待执行' : state.status === 'running' ? '执行中...' : state.status === 'done' ? '完成' : '出错';
+        function dotLeader(nameWidth, durationWidth) {
+            // Returns dot leader string; we use CSS flex to fill the space
+            return '· · · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·';
+        }
 
-            return `<div class="workflow-node ${statusClass}" id="${nodeId}"
-                        onclick="openStepPanel('${fullName}', '${stepName}', '${analystLabel}')"
-                        title="">
-                <div class="node-name">${repo.display_name}/${stepName}</div>
-                <div class="node-analyst">${analystLabel}</div>
-                <div class="node-status-row">
-                    <span class="node-status-dot"></span>
-                    <span class="node-status-text">${statusLabel}</span>
-                    ${durationHtml}
-                </div>
-                ${modelHtml}
-                <div class="workflow-node-tooltip">${promptSnippet}${promptSnippet.length >= 200 ? '...' : ''}</div>
+        // Returns WS live state for a step (or null)
+        function getLiveState(repoFullName, stepName, repoDisplayName) {
+            // WS step key format: "{displayName}/{stepName}"
+            const wsKey = `${repoDisplayName || repoFullName}/${stepName}`;
+            return _wfLiveStates[wsKey] || null;
+        }
+
+        function getStepStatus(step) {
+            const live = getLiveState(step.repo_full_name, step.step_name,
+                _repoDisplayMap[step.repo_full_name] || step.repo_full_name);
+            if (live) return live.status;
+            if (step.duration_s != null) return 'done';
+            return 'pending';
+        }
+
+        function getStepDuration(step) {
+            const live = getLiveState(step.repo_full_name, step.step_name,
+                _repoDisplayMap[step.repo_full_name] || step.repo_full_name);
+            if (live && live.duration_s != null) return live.duration_s;
+            return step.duration_s;
+        }
+
+        function renderTimelineItem(step, idx, isLive) {
+            const status = isLive ? (getStepStatus(step)) : 'done';
+            const duration = getStepDuration(step);
+            const iconMap = { done: '✓', running: '●', pending: '○', error: '✗' };
+            const icon = iconMap[status] || '○';
+
+            // Name: repo/step
+            const repoDisplay = _repoDisplayMap[step.repo_full_name] || step.repo_full_name.split('/')[1];
+            let stepLabel = step.step_name;
+            // Make synthetic label (global synthesis)
+            const isGlobal = step.repo_full_name === '__global__';
+            const displayName = isGlobal ? '全局综合' : `${repoDisplay}/${stepLabel}`;
+
+            const model = fmtModel(step.model);
+            const durStr = fmtSeconds(duration);
+
+            // Use data-* attributes to avoid quote escaping in onclick
+            return `<div class="timeline-item" id="tl-${idx}"
+                data-repo="${escapeHtml(step.repo_full_name)}"
+                data-step="${escapeHtml(step.step_name)}"
+                data-label="${escapeHtml(displayName)}"
+                onclick="handleTimelineClick(this)">
+                <span class="tl-icon ${status}">${icon}</span>
+                <span class="tl-name">${escapeHtml(displayName)}</span>
+                <span class="tl-leader">${dotLeader()}</span>
+                <span class="tl-duration">${escapeHtml(durStr)}</span>
+                <span class="tl-model">${escapeHtml(model)}</span>
             </div>`;
         }
 
-        function renderWorkflowDAG() {
-            if (!_workflowRepos.length) {
-                document.getElementById('workflow-dag').innerHTML = '<div class="loading" style="color:#565f89;">暂无项目</div>';
+        function handleTimelineClick(el) {
+            const repo = el.dataset.repo;
+            const step = el.dataset.step;
+            const label = el.dataset.label;
+            openStepPanel(repo, step, label);
+        }
+
+        async function loadWorkflowTimeline(liveUpdate = false) {
+            const wrap = document.getElementById('workflow-timeline-wrap');
+            if (!liveUpdate) {
+                wrap.innerHTML = '<div class="loading">加载中...</div>';
+            }
+
+            try {
+                // Load repo display names
+                const reposData = await fetchJSON('api/repos').catch(() => []);
+                _repoDisplayMap = {};
+                for (const r of reposData) _repoDisplayMap[r.full_name] = r.display_name;
+
+                // Check if there's a live run happening
+                const runStatus = await fetchJSON('api/run/status').catch(() => null);
+                const isRunning = runStatus && runStatus.running;
+
+                let steps = [];
+                let date = null;
+                let totalS = null;
+
+                if (isRunning && runStatus.steps && runStatus.steps.length > 0) {
+                    // Use live run data from _run_status
+                    // We'll merge DB steps with live data
+                    // Also get latest DB steps as baseline
+                    const wfData = await fetchJSON('api/workflow/latest').catch(() => null);
+                    if (wfData && wfData.steps) {
+                        steps = wfData.steps;
+                        date = wfData.date;
+                    }
+                } else {
+                    const wfData = await fetchJSON('api/workflow/latest').catch(() => null);
+                    if (wfData && wfData.steps) {
+                        steps = wfData.steps;
+                        date = wfData.date;
+                        totalS = wfData.total_s;
+                    }
+                }
+
+                _wfDate = date;
+                _wfSteps = steps;
+
+                if (!steps.length) {
+                    wrap.innerHTML = `<div class="workflow-container"><div class="loading" style="color:#565f89;">暂无分析数据，点击「立即分析」开始</div></div>`;
+                    return;
+                }
+
+                // Separate into Phase 1 (dimension steps, non-global) and Phase 2 (global synthesis)
+                const phase1Steps = steps.filter(s => s.repo_full_name !== '__global__');
+                const phase2Steps = steps.filter(s => s.repo_full_name === '__global__');
+
+                // Phase 1 duration = max step duration (parallel)
+                const phase1MaxDur = phase1Steps.length > 0
+                    ? Math.max(...phase1Steps.map(s => s.duration_s || 0))
+                    : null;
+                const phase2TotalDur = phase2Steps.reduce((sum, s) => sum + (s.duration_s || 0), 0);
+
+                // Actual total: use elapsed from run status or sum parallel + sequential
+                const actualTotal = isRunning
+                    ? (runStatus.elapsed_s || null)
+                    : (phase1MaxDur != null ? phase1MaxDur + phase2TotalDur : null);
+
+                // Format date for display
+                const dateStr = date || '—';
+                const totalStr = actualTotal ? fmtTotalTime(actualTotal) : '';
+
+                let html = `<div class="workflow-container">`;
+                html += `<div class="workflow-header">
+                    <span class="run-date">最近一次分析运行 — ${escapeHtml(dateStr)}</span>
+                    ${totalStr ? `<span class="run-total">总耗时 ${escapeHtml(totalStr)}</span>` : ''}
+                    ${isRunning ? '<span style="color:#7aa2f7; font-size:12px;" class="spin">↻</span> <span style="color:#7aa2f7; font-size:12px;">运行中</span>' : ''}
+                </div>`;
+
+                // Phase 1
+                const phase1Label = `Phase 1: 维度分析（并行）`;
+                const phase1Dur = phase1MaxDur ? fmtSeconds(phase1MaxDur) : '';
+                html += `<div class="phase-block">
+                    <div class="phase-label">
+                        <span>${phase1Label}</span>
+                        ${phase1Dur ? `<span class="phase-duration">${phase1Dur}</span>` : ''}
+                    </div>`;
+
+                // Sort phase1 steps by duration_s ascending (completed) then by created_at
+                const sortedPhase1 = [...phase1Steps].sort((a, b) => (a.duration_s || 999) - (b.duration_s || 999));
+                sortedPhase1.forEach((step, i) => {
+                    html += renderTimelineItem(step, `p1-${i}`, isRunning);
+                });
+                html += `</div>`;
+
+                // Phase 2
+                if (phase2Steps.length > 0) {
+                    const phase2Dur = phase2TotalDur ? fmtSeconds(phase2TotalDur) : '';
+                    html += `<div class="phase-block">
+                        <div class="phase-label">
+                            <span>Phase 2: 综合分析</span>
+                            ${phase2Dur ? `<span class="phase-duration">${phase2Dur}</span>` : ''}
+                        </div>`;
+                    phase2Steps.forEach((step, i) => {
+                        html += renderTimelineItem(step, `p2-${i}`, isRunning);
+                    });
+                    html += `</div>`;
+                }
+
+                // Footer
+                const totalSteps = steps.length;
+                html += `<div class="workflow-footer">
+                    <span>Total: <strong>${totalSteps} steps</strong></span>
+                    ${totalStr ? `<span>· <strong>${totalStr}</strong></span>` : ''}
+                </div>`;
+
+                html += `</div>`; // .workflow-container
+                wrap.innerHTML = html;
+
+            } catch (e) {
+                wrap.innerHTML = `<div class="error-msg">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        // WS event handlers for live workflow update
+        function handleWorkflowEvent(eventType, data) {
+            if (eventType === 'workflow_start') {
+                _wfLiveStates = {};
+                loadWorkflowTimeline(false);
+            } else if (eventType === 'step_start') {
+                const stepKey = data.step || '';
+                _wfLiveStates[stepKey] = { status: 'running', duration_s: null };
+                loadWorkflowTimeline(true);
+            } else if (eventType === 'step_done') {
+                const stepKey = data.step || '';
+                _wfLiveStates[stepKey] = { status: 'done', duration_s: data.duration_s };
+                loadWorkflowTimeline(true);
+            } else if (eventType === 'report_ready') {
+                _wfLiveStates = {};
+                loadWorkflowTimeline(false);
+            }
+        }
+
+        // Step detail panel
+        async function openStepPanel(repoFullName, stepName, displayLabel) {
+            const panel = document.getElementById('step-panel');
+            const titleEl = document.getElementById('step-panel-title');
+            const metaEl = document.getElementById('step-panel-meta');
+            const contentEl = document.getElementById('step-panel-content');
+
+            titleEl.textContent = displayLabel;
+            metaEl.textContent = '';
+            contentEl.innerHTML = '<div class="loading">加载中...</div>';
+            panel.style.display = 'block';
+
+            // Highlight active item
+            document.querySelectorAll('.timeline-item').forEach(el => el.classList.remove('active'));
+
+            if (!_wfDate) {
+                contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>';
                 return;
             }
 
-            const dimModel = 'haiku-4-5';
-            const synModel = 'sonnet-4-6';
-
-            const stepDefs = [
-                { name: 'issues',  analystId: 'issues',    label: '用户研究分析师' },
-                { name: 'prs',     analystId: 'prs',       label: '社区生态分析师' },
-                { name: 'commits', analystId: 'commits',   label: '工程方向分析师' },
-                { name: 'main',    analystId: 'commits',   label: '版本节奏分析师' },
-            ];
-
-            let html = '<div class="workflow-dag">';
-
-            for (const repo of _workflowRepos) {
-                // Column: dimension nodes
-                html += '<div class="workflow-col">';
-                html += `<div class="workflow-col-label">${repo.display_name}</div>`;
-                for (const step of stepDefs) {
-                    html += renderWorkflowNode(repo, step.name, step.analystId, step.label, dimModel);
-                }
-                html += '</div>';
-                html += '<div class="workflow-arrow">→</div>';
-
-                // Synthesis node for this repo (not in DB as a step currently, show as pending placeholder)
-                const synthState = _workflowStepStates[`${repo.full_name}/synthesis`] || { status: 'pending', duration_s: null };
-                const synthStatus = synthState.status === 'done' ? 'done' : 'pending';
-                html += `<div class="workflow-col" style="justify-content:center;">
-                    <div class="workflow-col-label">合成</div>
-                    <div class="workflow-node status-${synthStatus}" style="align-self:center; margin-top:30px;"
-                         onclick="openStepPanel('${repo.full_name}', 'synthesis', '综合分析师')">
-                        <div class="node-name">${repo.display_name} 合成</div>
-                        <div class="node-analyst">综合分析师</div>
-                        <div class="node-status-row">
-                            <span class="node-status-dot"></span>
-                            <span class="node-status-text">${synthStatus === 'done' ? '完成' : '待执行'}</span>
-                        </div>
-                        <div class="node-model">${synModel}</div>
-                    </div>
-                </div>`;
-                html += '<div class="workflow-arrow-big">→</div>';
-            }
-
-            // Global synthesis
-            const globalState = _workflowStepStates['__global__/synthesis'] || { status: 'pending', duration_s: null };
-            const globalStatus = globalState.status;
-            html += `<div class="workflow-col" style="justify-content:center;">
-                <div class="workflow-col-label">全局</div>
-                <div class="workflow-node status-${globalStatus}" style="align-self:center; min-width:140px;"
-                     onclick="openGlobalStepPanel()">
-                    <div class="node-name">全局综合</div>
-                    <div class="node-analyst">综合分析师</div>
-                    <div class="node-status-row">
-                        <span class="node-status-dot"></span>
-                        <span class="node-status-text">${globalStatus === 'done' ? '完成' : globalStatus === 'running' ? '执行中...' : '待执行'}</span>
-                        ${globalState.duration_s ? `<span class="node-duration">${globalState.duration_s}s</span>` : ''}
-                    </div>
-                    <div class="node-model">${synModel}</div>
-                </div>
-            </div>`;
-
-            html += '</div>'; // .workflow-dag
-            document.getElementById('workflow-dag').innerHTML = html;
-        }
-
-        async function openStepPanel(repoFullName, stepName, analystLabel) {
-            const panel = document.getElementById('step-panel');
-            const titleEl = document.getElementById('step-panel-title');
-            const metaEl = document.getElementById('step-panel-meta');
-            const contentEl = document.getElementById('step-panel-content');
-
-            titleEl.textContent = `${repoFullName} / ${stepName}`;
-            metaEl.textContent = analystLabel;
-            contentEl.innerHTML = '<div class="loading">加载中...</div>';
-            panel.style.display = 'block';
-
-            // Try to load from analysis_steps API
-            if (!_workflowDate) { contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>'; return; }
-            const [owner, name] = repoFullName.split('/');
             try {
-                const step = await fetchJSON(`api/analysis-steps/${_workflowDate}/${owner}/${name}/${stepName}`);
-                const durationStr = step.duration_s ? ` · ${step.duration_s.toFixed(1)}s` : '';
-                const modelStr = step.model ? ` · ${step.model}` : '';
-                metaEl.textContent = `${analystLabel}${durationStr}${modelStr}`;
-                contentEl.innerHTML = marked.parse(step.content || '');
-            } catch (e) {
-                // Fallback: show repo report
-                try {
-                    const rep = await fetchJSON(`api/report/${_workflowDate}?repo=${encodeURIComponent(repoFullName)}`);
+                if (repoFullName === '__global__') {
+                    const rep = await fetchJSON(`api/report/${_wfDate}`);
                     contentEl.innerHTML = marked.parse(rep.content || '（暂无数据）');
-                } catch {
-                    contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>';
+                } else {
+                    const [owner, name] = repoFullName.split('/');
+                    try {
+                        const step = await fetchJSON(`api/analysis-steps/${_wfDate}/${owner}/${name}/${stepName}`);
+                        const durationStr = step.duration_s ? ` · ${Math.round(step.duration_s)}s` : '';
+                        const modelStr = step.model ? ` · ${step.model}` : '';
+                        metaEl.textContent = `${stepName}${durationStr}${modelStr}`;
+                        contentEl.innerHTML = marked.parse(step.content || '');
+                    } catch {
+                        // Fallback to repo report
+                        const rep = await fetchJSON(`api/report/${_wfDate}?repo=${encodeURIComponent(repoFullName)}`);
+                        contentEl.innerHTML = marked.parse(rep.content || '（暂无数据）');
+                    }
                 }
-            }
-        }
-
-        async function openGlobalStepPanel() {
-            const panel = document.getElementById('step-panel');
-            const titleEl = document.getElementById('step-panel-title');
-            const metaEl = document.getElementById('step-panel-meta');
-            const contentEl = document.getElementById('step-panel-content');
-
-            titleEl.textContent = '全局综合分析';
-            metaEl.textContent = '综合分析师';
-            contentEl.innerHTML = '<div class="loading">加载中...</div>';
-            panel.style.display = 'block';
-
-            if (!_workflowDate) { contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>'; return; }
-            try {
-                const rep = await fetchJSON(`api/report/${_workflowDate}`);
-                contentEl.innerHTML = marked.parse(rep.content || '（暂无数据）');
             } catch {
                 contentEl.innerHTML = '<div style="color:#565f89;">暂无数据</div>';
             }
@@ -2024,7 +2100,13 @@ def get_dashboard_html() -> str:
 
         function closeStepPanel() {
             document.getElementById('step-panel').style.display = 'none';
+            document.querySelectorAll('.timeline-item').forEach(el => el.classList.remove('active'));
         }
+
+        // ── Agents 配置 ──────────────────────────────────────────────────────────────
+
+        let _agentsData = [];
+        let _agentsLoaded = false;
 
         function toggleAgentsSection() {
             const el = document.getElementById('agents-content');
@@ -2032,68 +2114,15 @@ def get_dashboard_html() -> str:
             if (el.style.display === 'none') {
                 el.style.display = 'block';
                 icon.textContent = '▲ 收起';
-                loadAgents();
+                if (!_agentsLoaded) {
+                    loadAgents();
+                    _agentsLoaded = true;
+                }
             } else {
                 el.style.display = 'none';
                 icon.textContent = '▼ 展开';
             }
         }
-
-        // Handle WS workflow events to update DAG in real-time
-        function handleWorkflowEvent(eventType, data) {
-            if (eventType === 'workflow_start') {
-                _workflowStepStates = {};
-                renderWorkflowDAG();
-            } else if (eventType === 'step_start') {
-                const step = data.step || '';
-                _workflowStepStates[step] = { status: 'running', duration_s: null };
-                updateNodeStatus(step, 'running', null);
-            } else if (eventType === 'step_done') {
-                const step = data.step || '';
-                _workflowStepStates[step] = { status: 'done', duration_s: data.duration_s };
-                updateNodeStatus(step, 'done', data.duration_s);
-            } else if (eventType === 'report_ready') {
-                // Refresh workflow to show final state
-                loadWorkflow();
-            }
-        }
-
-        function updateNodeStatus(stepKey, status, durationS) {
-            // Try to find node by step key pattern
-            // step key format: "RepoDisplayName/stepname" or "__global__/synthesis"
-            document.querySelectorAll('.workflow-node').forEach(node => {
-                const nodeId = node.id || '';
-                // Match based on content
-                const nameDivs = node.querySelectorAll('.node-name');
-                nameDivs.forEach(nd => {
-                    const text = nd.textContent.toLowerCase();
-                    const keyLower = stepKey.toLowerCase();
-                    if (keyLower.includes(text.split('/')[0]?.toLowerCase()) ||
-                        text.toLowerCase().includes(stepKey.split('/').pop())) {
-                        // Update status class
-                        node.classList.remove('status-pending', 'status-running', 'status-done', 'status-error');
-                        node.classList.add(`status-${status}`);
-                        // Update status text
-                        const statusTextEl = node.querySelector('.node-status-text');
-                        if (statusTextEl) statusTextEl.textContent = status === 'running' ? '执行中...' : status === 'done' ? '完成' : status;
-                        // Update duration
-                        if (durationS && status === 'done') {
-                            const durationEl = node.querySelector('.node-duration');
-                            if (durationEl) {
-                                durationEl.textContent = `${durationS}s`;
-                            } else {
-                                const row = node.querySelector('.node-status-row');
-                                if (row) row.insertAdjacentHTML('beforeend', `<span class="node-duration">${durationS}s</span>`);
-                            }
-                        }
-                    }
-                });
-            });
-        }
-
-        // ── Agents ─────────────────────────────────────────────────────────────────
-
-        let _agentsData = [];
 
         async function loadAgents() {
             try {
@@ -2132,81 +2161,56 @@ def get_dashboard_html() -> str:
             const viewEl = document.getElementById(`agent-view-${agentId}`);
             const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
             const actionsEl = document.getElementById(`agent-actions-${agentId}`);
-
             viewEl.style.display = 'none';
             textareaEl.style.display = 'block';
-
-            actionsEl.innerHTML = `
-                <button class="btn btn-success btn-sm" onclick="saveAgent('${agentId}')">保存</button>
-                <button class="btn btn-sm" style="background:#1e1e2e; color:#565f89; border-color:#2a2d3e;" onclick="cancelEditAgent('${agentId}')">取消</button>
-            `;
+            actionsEl.innerHTML = `<button class="btn btn-success btn-sm" onclick="saveAgent('${agentId}')">保存</button><button class="btn btn-sm" style="background:#1e1e2e; color:#565f89; border-color:#2a2d3e;" onclick="cancelEditAgent('${agentId}')">取消</button>`;
         }
 
         function cancelEditAgent(agentId) {
             const agent = _agentsData.find(a => a.id === agentId);
             if (!agent) return;
-
             const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
             textareaEl.value = agent.content || '';
             textareaEl.style.display = 'none';
-
-            const viewEl = document.getElementById(`agent-view-${agentId}`);
-            viewEl.style.display = 'block';
-
-            const actionsEl = document.getElementById(`agent-actions-${agentId}`);
-            actionsEl.innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
+            document.getElementById(`agent-view-${agentId}`).style.display = 'block';
+            document.getElementById(`agent-actions-${agentId}`).innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
         }
 
         async function saveAgent(agentId) {
             const textareaEl = document.getElementById(`agent-textarea-${agentId}`);
             const newContent = textareaEl.value;
-
             const saveBtn = document.querySelector(`#agent-actions-${agentId} .btn-success`);
             if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中...'; }
-
             try {
                 await fetchJSON(`api/agents/${agentId}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ content: newContent }),
                 });
-
-                // 更新本地缓存
                 const agent = _agentsData.find(a => a.id === agentId);
                 if (agent) agent.content = newContent;
-
-                // 切回渲染模式
                 textareaEl.style.display = 'none';
                 const viewEl = document.getElementById(`agent-view-${agentId}`);
                 viewEl.innerHTML = marked.parse(newContent);
                 viewEl.style.display = 'block';
-
-                const actionsEl = document.getElementById(`agent-actions-${agentId}`);
-                actionsEl.innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
+                document.getElementById(`agent-actions-${agentId}`).innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
             } catch (e) {
                 if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
                 alert(`保存失败: ${e.message}`);
             }
         }
 
-        // ── WebSocket 实时推送 ───────────────────────────────────────────────────────
+        // ── WebSocket ─────────────────────────────────────────────────────────────
 
         let _ws = null;
         let _wsReconnectTimer = null;
         let _wsConnected = false;
+        let _wsInfoLang = 'js';
 
         function _wsStatusChanged() {
-            // 如果 Settings 页面正在展示，刷新 WS 信息区
-            const activeTab = document.querySelector('.tab.active');
-            if (activeTab) {
-                const onclick = activeTab.getAttribute('onclick') || '';
-                if (onclick.includes('settings')) refreshWsInfo();
-            }
+            const activeTab = document.querySelector('.nav-tab.active');
+            if (activeTab && activeTab.textContent === 'Settings') refreshWsInfo();
         }
-
-        // ── WS API 文档 modal ────────────────────────────────────────────────────────
-
-        let _wsInfoLang = 'js';
 
         function switchWsLang(lang) {
             _wsInfoLang = lang;
@@ -2227,128 +2231,56 @@ def get_dashboard_html() -> str:
                 ? '<span style="color:#9ece6a;">已连接 ✓</span>'
                 : '<span style="color:#f7768e;">未连接 ✗</span>';
 
-            // fetch client count async, then render
             fetchJSON('api/ws/status').then(s => {
                 const clients = s.clients;
 
-                const jsCode =
-`const ws = new WebSocket('${wsUrl}');
-
+                const jsCode = `const ws = new WebSocket('${wsUrl}');
 ws.onopen = () =&gt; console.log('[pulse] connected');
-
 ws.onmessage = (e) =&gt; {
   const event = JSON.parse(e.data);
   if (event.type === 'report_ready') {
     console.log('New report:', event.data.date);
-    console.log('Repos:', event.data.repos);
   }
-};
+};`;
 
-ws.onclose = () =&gt; console.log('[pulse] disconnected');`;
-
-                const pyCode =
-`import asyncio
-import json
-import websockets  # pip install websockets
-
+                const pyCode = `import asyncio, json, websockets
 async def listen():
-    uri = "${wsUrl}"
-    async with websockets.connect(uri) as ws:
-        print(f"[pulse] connected to {uri}")
-        async for message in ws:
-            event = json.loads(message)
-            if event["type"] == "report_ready":
-                print(f"New report: {event['data']['date']}")
-                print(f"Repos: {event['data']['repos']}")
-
+    async with websockets.connect("${wsUrl}") as ws:
+        async for msg in ws:
+            event = json.loads(msg)
+            print(event["type"], event.get("data", {}))
 asyncio.run(listen())`;
 
-                const curlCode =
-`# curl does not natively support WebSocket.
-# Use websocat instead:
-
-# Install (macOS)
-brew install websocat
-
-# Connect and listen
-websocat ${wsUrl}
-
-# Verbose output
-websocat -v ${wsUrl}`;
-
-                const schemaRows = [
-                    ['type',               'string',   '事件类型，固定值 <code style="color:#bb9af7;font-size:11px;">report_ready</code>'],
-                    ['data.date',          'string',   '报告日期，格式 YYYY-MM-DD'],
-                    ['data.repos',         'string[]', '本次分析的项目 display_name 列表'],
-                    ['data.dashboard_url', 'string',   'Dashboard 访问地址'],
-                ].map(([field, type, desc]) => `
-                                <tr>
-                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;font-family:monospace;font-size:12px;color:#f7768e;">${field}</td>
-                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;color:#bb9af7;font-size:12px;">${type}</td>
-                                    <td style="padding:7px 10px;border:1px solid #2a2d3e;color:#a9b1d6;font-size:12px;">${desc}</td>
-                                </tr>`).join('');
+                const curlCode = `# brew install websocat
+websocat ${wsUrl}`;
 
                 document.getElementById('ws-api-modal-body').innerHTML = `
-                    <!-- 连接信息 -->
                     <div style="padding:14px 0 16px;border-bottom:1px solid #2a2d3e;margin-bottom:18px;">
                         <div style="margin-bottom:10px;">
                             <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">连接地址</span><br>
                             <code style="font-size:12.5px;color:#f7768e;background:#16161e;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;display:inline-block;margin-top:4px;word-break:break-all;">${wsUrl}</code>
                         </div>
                         <div style="display:flex;gap:28px;flex-wrap:wrap;">
-                            <div>
-                                <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">当前状态</span><br>
-                                <span style="font-size:13px;margin-top:3px;display:inline-block;">${connStatus}</span>
-                            </div>
-                            <div>
-                                <span style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;">在线客户端</span><br>
-                                <span style="font-size:13px;color:#e0e2f0;margin-top:3px;display:inline-block;">${clients} 个</span>
-                            </div>
+                            <div><span style="font-size:11px;color:#565f89;">当前状态</span><br><span style="font-size:13px;margin-top:3px;display:inline-block;">${connStatus}</span></div>
+                            <div><span style="font-size:11px;color:#565f89;">在线客户端</span><br><span style="font-size:13px;color:#e0e2f0;margin-top:3px;display:inline-block;">${clients} 个</span></div>
                         </div>
                     </div>
-
-                    <!-- 代码示例 -->
                     <div style="margin-bottom:18px;">
                         <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">订阅示例</div>
                         <div style="display:flex;gap:0;border:1px solid #2a2d3e;border-radius:6px;overflow:hidden;width:fit-content;margin-bottom:12px;">
                             <button id="ws-lang-js" class="pr-toggle-btn active" onclick="switchWsLang('js')">JavaScript</button>
                             <button id="ws-lang-python" class="pr-toggle-btn" onclick="switchWsLang('python')">Python</button>
-                            <button id="ws-lang-curl" class="pr-toggle-btn" onclick="switchWsLang('curl')">curl / websocat</button>
+                            <button id="ws-lang-curl" class="pr-toggle-btn" onclick="switchWsLang('curl')">curl</button>
                         </div>
                         <div id="ws-code-js"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${jsCode}</code></pre></div>
                         <div id="ws-code-python" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${pyCode}</code></pre></div>
                         <div id="ws-code-curl" style="display:none;"><pre style="margin:0;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>${curlCode}</code></pre></div>
-                    </div>
-
-                    <!-- 事件格式 -->
-                    <div>
-                        <div style="font-size:11px;color:#565f89;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">事件格式 — <code style="color:#bb9af7;font-size:11px;text-transform:none;letter-spacing:0;">report_ready</code></div>
-                        <pre style="margin:0 0 12px;background:#16161e;border:1px solid #2a2d3e;border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:12.5px;color:#cdd6f4;line-height:1.7;"><code>{
-  <span style="color:#7aa2f7;">"type"</span>: <span style="color:#9ece6a;">"report_ready"</span>,
-  <span style="color:#7aa2f7;">"data"</span>: {
-    <span style="color:#7aa2f7;">"date"</span>:          <span style="color:#9ece6a;">"2026-03-26"</span>,
-    <span style="color:#7aa2f7;">"repos"</span>:         [<span style="color:#9ece6a;">"claude-code"</span>, <span style="color:#9ece6a;">"codex"</span>, <span style="color:#9ece6a;">"openclaw"</span>],
-    <span style="color:#7aa2f7;">"dashboard_url"</span>: <span style="color:#9ece6a;">"http://localhost:8765"</span>
-  }
-}</code></pre>
-                        <table style="width:100%;border-collapse:collapse;">
-                            <thead>
-                                <tr>
-                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">字段</th>
-                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">类型</th>
-                                    <th style="padding:7px 10px;border:1px solid #2a2d3e;background:#1e1e2e;color:#e0e2f0;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">说明</th>
-                                </tr>
-                            </thead>
-                            <tbody>${schemaRows}</tbody>
-                        </table>
                     </div>`;
 
                 document.getElementById('ws-api-modal').classList.add('open');
-                // restore last-selected lang tab
                 switchWsLang(_wsInfoLang);
             }).catch(() => {
-                document.getElementById('ws-api-modal-body').innerHTML =
-                    '<div class="error-msg">WS 状态加载失败</div>';
+                document.getElementById('ws-api-modal-body').innerHTML = '<div class="error-msg">WS 状态加载失败</div>';
                 document.getElementById('ws-api-modal').classList.add('open');
             });
         }
@@ -2369,14 +2301,12 @@ websocat -v ${wsUrl}`;
                 const connDot = _wsConnected
                     ? '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#9ece6a;margin-right:5px;vertical-align:middle;"></span><span style="color:#9ece6a;vertical-align:middle;">已连接</span>'
                     : '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#f7768e;margin-right:5px;vertical-align:middle;"></span><span style="color:#f7768e;vertical-align:middle;">未连接</span>';
-
-                el.innerHTML = `
-                    <div style="margin-top:12px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
-                        <code style="font-size:12px;color:#f7768e;background:#1e2030;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;word-break:break-all;">${wsUrl}</code>
-                        <span style="font-size:12px;">${connDot}</span>
-                        <span style="font-size:12px;color:#565f89;">${s.clients} 客户端在线</span>
-                        <button class="btn btn-primary btn-sm" onclick="openWsApiModal()" style="margin-left:auto;">API 文档</button>
-                    </div>`;
+                el.innerHTML = `<div style="margin-top:12px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+                    <code style="font-size:12px;color:#f7768e;background:#1e2030;padding:3px 8px;border-radius:4px;border:1px solid #2a2d3e;word-break:break-all;">${wsUrl}</code>
+                    <span style="font-size:12px;">${connDot}</span>
+                    <span style="font-size:12px;color:#565f89;">${s.clients} 客户端在线</span>
+                    <button class="btn btn-primary btn-sm" onclick="openWsApiModal()" style="margin-left:auto;">API 文档</button>
+                </div>`;
             } catch (e) {
                 el.innerHTML = `<div class="error-msg" style="margin-top:10px;font-size:12px;">WS 状态加载失败: ${e.message}</div>`;
             }
@@ -2388,7 +2318,6 @@ websocat -v ${wsUrl}`;
             try {
                 _ws = new WebSocket(wsUrl);
                 _ws.onopen = () => {
-                    console.log('[ws] 已连接');
                     _wsConnected = true;
                     _wsStatusChanged();
                     if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
@@ -2396,44 +2325,27 @@ websocat -v ${wsUrl}`;
                 _ws.onmessage = (e) => {
                     try {
                         const msg = JSON.parse(e.data);
-                        const activeTab = document.querySelector('.tab.active');
-                        const tabName = activeTab ? (activeTab.getAttribute('onclick').match(/switchTab\('(.+?)'\)/)?.[1] || '') : '';
+                        const activeTab = document.querySelector('.nav-tab.active');
+                        const tabName = activeTab ? activeTab.getAttribute('onclick').match(/switchTab\('(.+?)'\)/)?.[1] || '' : '';
 
-                        // Handle workflow events
-                        if (['workflow_start', 'step_start', 'step_done'].includes(msg.type)) {
+                        if (['workflow_start', 'step_start', 'step_done', 'report_ready'].includes(msg.type)) {
                             if (tabName === 'workflow') handleWorkflowEvent(msg.type, msg.data);
                         }
 
                         if (msg.type === 'report_ready') {
-                            console.log('[ws] 收到 report_ready，刷新数据...');
-                            if (tabName === 'workflow') handleWorkflowEvent(msg.type, msg.data);
-                            // 自动刷新当前 tab 数据
-                            if (tabName === 'overview' || !tabName) {
-                                loadOverview(); loadTodayInsight();
-                            } else if (tabName === 'reports') {
-                                loadReportDates();
-                            } else if (tabName === 'trends') {
-                                loadTrends();
-                            }
-                            // 无论如何都刷新概览数据（后台）
+                            if (tabName === 'overview' || !tabName) { loadOverview(); loadTodayInsight(); }
+                            else if (tabName === 'reports') { loadReportDates(); }
+                            else if (tabName === 'trends') { loadTrends(); }
                             loadOverview();
                         }
                     } catch {}
                 };
                 _ws.onclose = () => {
-                    console.log('[ws] 连接断开，5秒后重连...');
-                    _ws = null;
-                    _wsConnected = false;
-                    _wsStatusChanged();
+                    _ws = null; _wsConnected = false; _wsStatusChanged();
                     _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
                 };
-                _ws.onerror = () => {
-                    _ws = null;
-                    _wsConnected = false;
-                    _wsStatusChanged();
-                };
+                _ws.onerror = () => { _ws = null; _wsConnected = false; _wsStatusChanged(); };
             } catch (e) {
-                console.log('[ws] 连接失败，5秒后重试');
                 _wsConnected = false;
                 _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
             }
@@ -2480,7 +2392,6 @@ websocat -v ${wsUrl}`;
                     </div>
                     <div id="sched-feedback" style="font-size:12px; color:#9ece6a; margin-top:6px; display:none;"></div>
                 </div>
-
                 <div class="settings-section">
                     <h3>WebSocket 实时推送</h3>
                     <p class="desc">开启后，dashboard 页面会在新报告生成时自动刷新</p>
@@ -2493,7 +2404,6 @@ websocat -v ${wsUrl}`;
                     </div>
                     <div id="ws-info-area"></div>
                 </div>
-
                 <div class="settings-section">
                     <h3>Webhook 通知</h3>
                     <p class="desc">报告生成后，向以下 URL 发送 POST 请求</p>
@@ -2508,13 +2418,9 @@ websocat -v ${wsUrl}`;
                 </div>`;
 
             document.getElementById('settings-content').innerHTML = html;
-
-            // 绑定 toggle label 更新
             document.getElementById('ws-toggle').addEventListener('change', function() {
                 document.getElementById('ws-toggle-label').textContent = this.checked ? '已开启' : '已关闭';
             });
-
-            // 渲染 WS 连接信息
             refreshWsInfo();
         }
 
@@ -2535,21 +2441,16 @@ websocat -v ${wsUrl}`;
                 fb.textContent = `已保存：每天 ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')} 执行`;
                 fb.style.display = 'block';
                 setTimeout(() => { fb.style.display = 'none'; }, 3000);
-            } catch (e) {
-                alert(`保存失败: ${e.message}`);
-            }
+            } catch (e) { alert(`保存失败: ${e.message}`); }
         }
 
         async function saveWsEnabled(enabled) {
             try {
                 _settings = await fetchJSON('api/settings', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
+                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ websocket_enabled: enabled }),
                 });
-            } catch (e) {
-                alert(`保存失败: ${e.message}`);
-            }
+            } catch (e) { alert(`保存失败: ${e.message}`); }
         }
 
         async function addWebhook() {
@@ -2564,8 +2465,7 @@ websocat -v ${wsUrl}`;
             const newWebhooks = [...(_settings.webhooks || []), url];
             try {
                 _settings = await fetchJSON('api/settings', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
+                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ webhooks: newWebhooks }),
                 });
                 document.getElementById('new-webhook-url').value = '';
@@ -2580,43 +2480,34 @@ websocat -v ${wsUrl}`;
             const newWebhooks = (_settings.webhooks || []).filter((_, i) => i !== index);
             try {
                 _settings = await fetchJSON('api/settings', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
+                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ webhooks: newWebhooks }),
                 });
                 renderSettings();
-            } catch (e) {
-                alert(`删除失败: ${e.message}`);
-            }
+            } catch (e) { alert(`删除失败: ${e.message}`); }
         }
 
         async function testWebhook(url) {
             try {
                 const r = await fetchJSON('api/settings/test-webhook', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url }),
                 });
                 alert(`测试成功，响应状态: ${r.status}`);
-            } catch (e) {
-                alert(`测试失败: ${e.message}`);
-            }
+            } catch (e) { alert(`测试失败: ${e.message}`); }
         }
 
-        // 点击 modal 外部关闭
+        // ── Modal close handlers ─────────────────────────────────────────────────
+
         document.getElementById('add-repo-modal').addEventListener('click', function(e) {
             if (e.target === this) closeAddRepoModal();
         });
 
-        // ESC 关闭 WS API modal
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                closeWsApiModal();
-                closeAddRepoModal();
-            }
+            if (e.key === 'Escape') { closeWsApiModal(); closeAddRepoModal(); closeStepPanel(); }
         });
 
-        // 点击 WS API modal 外部关闭（延迟绑定，因为 modal DOM 在 script 之后）
+        // setTimeout(0) fix: bind WS modal close after DOM renders
         setTimeout(() => {
             const wsModal = document.getElementById('ws-api-modal');
             if (wsModal) wsModal.addEventListener('click', function(e) {
@@ -2624,7 +2515,8 @@ websocat -v ${wsUrl}`;
             });
         }, 0);
 
-                // 初始化
+        // ── Init ─────────────────────────────────────────────────────────────────
+
         checkRunStatus();
         loadOverview();
         loadReportDates();
@@ -2632,16 +2524,5 @@ websocat -v ${wsUrl}`;
         loadTrends();
         connectWebSocket();
     </script>
-
-    <!-- WS API 文档 Modal -->
-    <div id="ws-api-modal" class="modal-overlay">
-        <div class="modal" style="width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-shrink:0;">
-                <h3 style="margin:0;">WebSocket API</h3>
-                <button onclick="closeWsApiModal()" style="background:none;border:none;color:#565f89;font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;" title="关闭 (ESC)">✕</button>
-            </div>
-            <div id="ws-api-modal-body" style="overflow-y:auto;flex:1;"></div>
-        </div>
-    </div>
 </body>
 </html>"""
