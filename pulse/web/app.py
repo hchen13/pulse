@@ -1989,6 +1989,7 @@ def get_dashboard_html() -> str:
             const live = getLiveState(step.repo_full_name, step.step_name,
                 _repoDisplayMap[step.repo_full_name] || step.repo_full_name);
             if (live) return live.status;
+            if (step._liveStatus) return step._liveStatus;
             if (step.duration_s != null) return 'done';
             return 'pending';
         }
@@ -2077,10 +2078,10 @@ def get_dashboard_html() -> str:
                 let date = null;
                 let totalS = null;
 
-                if (isRunning && runStatus.steps && runStatus.steps.length > 0) {
-                    // Use live run data from _run_status
-                    // We'll merge DB steps with live data
-                    // Also get latest DB steps as baseline
+                if (_wfStartTime && Object.keys(_wfLiveStates).length > 0) {
+                    // New run in progress: use _wfLiveStates only, don't read DB
+                    date = new Date().toISOString().slice(0, 10);
+                } else if (isRunning && runStatus.steps && runStatus.steps.length > 0) {
                     const wfData = await fetchJSON('api/workflow/latest').catch(() => null);
                     if (wfData && wfData.steps) {
                         steps = wfData.steps;
@@ -2097,6 +2098,36 @@ def get_dashboard_html() -> str:
 
                 _wfDate = date;
                 _wfSteps = steps;
+
+                // If running (or just started) and we have live states, build steps from those
+                if (!steps.length && (_wfStartTime || isRunning) && Object.keys(_wfLiveStates).length > 0) {
+                    steps = Object.entries(_wfLiveStates).map(([key, state]) => {
+                        const parts = key.split('/');
+                        let repo_full_name, step_name;
+                        if (key === 'global/synthesis') {
+                            repo_full_name = '__global__';
+                            step_name = 'synthesis';
+                        } else if (key.startsWith('fetch/')) {
+                            repo_full_name = key.replace('fetch/', '');
+                            step_name = 'fetch';
+                        } else if (parts.length >= 2) {
+                            step_name = parts.pop();
+                            repo_full_name = parts.join('/');
+                        } else {
+                            repo_full_name = key;
+                            step_name = 'unknown';
+                        }
+                        return {
+                            repo_full_name,
+                            step_name,
+                            duration_s: state.duration_s,
+                            created_at: null,
+                            model: step_name === 'fetch' ? '—' : (step_name === 'synthesis' ? 'sonnet' : 'haiku'),
+                            _liveStatus: state.status,
+                        };
+                    });
+                    date = new Date().toISOString().slice(0, 10);
+                }
 
                 if (!steps.length) {
                     wrap.innerHTML = `<div class="workflow-container"><div class="loading" style="color:#565f89;">暂无分析数据，点击「立即分析」开始</div></div>`;
@@ -2219,18 +2250,18 @@ def get_dashboard_html() -> str:
             if (eventType === 'workflow_start') {
                 _wfLiveStates = {};
                 _wfStartTime = new Date();
-                // Clear timeline immediately
-                const wrap = document.getElementById('workflow-timeline-wrap');
-                if (wrap) {
-                    const startStr = _wfStartTime.toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
-                    wrap.innerHTML = `<div class="workflow-container">
-                        <div class="workflow-header">
-                            <span class="run-date">开始时间: ${startStr}</span>
-                            <span style="color:#7aa2f7; font-size:12px;" class="spin">↻</span>
-                            <span style="color:#7aa2f7; font-size:12px;">运行中...</span>
-                        </div>
-                    </div>`;
+                // Render all expected steps in pending (gray) state
+                const repoNames = repos.map(r => r.full_name);
+                // Pre-populate all expected steps as pending
+                for (const repo of repoNames) {
+                    _wfLiveStates[`fetch/${repo}`] = { status: 'pending', duration_s: null };
+                    for (const dim of ['issues', 'prs', 'commits', 'main']) {
+                        _wfLiveStates[`${repo}/${dim}`] = { status: 'pending', duration_s: null };
+                    }
+                    _wfLiveStates[`${repo}/synthesis`] = { status: 'pending', duration_s: null };
                 }
+                _wfLiveStates['global/synthesis'] = { status: 'pending', duration_s: null };
+                loadWorkflowTimeline(true);
                 return;
             } else if (eventType === 'step_start') {
                 const stepKey = data.step || '';
@@ -2242,6 +2273,7 @@ def get_dashboard_html() -> str:
                 loadWorkflowTimeline(true);
             } else if (eventType === 'report_ready') {
                 _wfLiveStates = {};
+                _wfStartTime = null;
                 loadWorkflowTimeline(false);
             }
         }
