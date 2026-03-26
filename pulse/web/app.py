@@ -1627,14 +1627,12 @@ def get_dashboard_html() -> str:
                     const release = r.latest_release
                         ? r.latest_release.tag_name
                         : '—';
-                    repoHtml += `<div class="repo-row" style="display:block; padding:10px 14px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                    repoHtml += `<div class="repo-row" style="display:block; padding:10px 14px; position:relative;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
                             <a href="https://github.com/${r.full_name}" target="_blank" style="font-size:13px; color:#e0e2f0; font-weight:500; text-decoration:none;">${escapeHtml(r.display_name)}</a>
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <span style="font-size:11px; color:#565f89;">${escapeHtml(release)}</span>
-                                <button class="btn btn-danger btn-sm delete-btn" onclick="deleteRepo('${r.full_name}')" style="font-size:10px; padding:1px 6px;">删除</button>
-                            </div>
+                            <button class="btn btn-danger btn-sm delete-btn" onclick="deleteRepo('${r.full_name}')" style="font-size:10px; padding:1px 6px;">删除</button>
                         </div>
+                        <div style="font-size:11px; color:#565f89; margin:2px 0 4px;">${escapeHtml(release)}</div>
                         <div style="display:flex; gap:12px; font-size:11px; color:#a9b1d6;">
                             <span><span style="font-weight:600; color:#e0e2f0;">${r.issues_open}</span> issues</span>
                             <span><span style="font-weight:600; color:#e0e2f0;">${r.prs_open}</span> PRs</span>
