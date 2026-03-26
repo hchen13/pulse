@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pulse.web</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/claire/.openclaw/agents/xinge/projects/pulse/venv/bin/pulse</string>
+        <string>--config</string>
+        <string>/Users/claire/.openclaw/agents/xinge/projects/pulse/config.yaml</string>
+        <string>serve</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8765</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/claire/.openclaw/agents/xinge/projects/pulse</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/claire/.openclaw/agents/xinge/projects/pulse/venv/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/claire</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/claire/.openclaw/agents/xinge/projects/pulse/logs/web.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/claire/.openclaw/agents/xinge/projects/pulse/logs/web.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

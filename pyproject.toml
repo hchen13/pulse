@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulse"
+version = "0.1.0"
+description = "AI Harness 竞品情报系统"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "croniter>=2.0",
+    "requests>=2.28",
+]
+
+[project.scripts]
+pulse = "pulse.main:cli"
