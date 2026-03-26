@@ -244,7 +244,7 @@ def _run_full_cycle():
         import time as _time
         from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
         logger.info(f"[run] 开始并行采集 {len(repos)} 个项目")
-        tracked_broadcast("step_start", {"step": "fetch/all", "run_id": run_id})
+        # Don't broadcast fetch/all as a visible step (it's a meta-step)
         fetch_start = _time.time()
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             def _fetch_repo(repo):
@@ -272,7 +272,7 @@ def _run_full_cycle():
                 except Exception as e:
                     logger.error(f"[run] 采集失败 {repo.full_name}: {e}")
         fetch_dur = _time.time() - fetch_start
-        tracked_broadcast("step_done", {"step": "fetch/all", "run_id": run_id, "duration_s": round(fetch_dur, 1)})
+        logger.info(f"[run] 采集完成，总耗时 {round(fetch_dur, 1)}s")
 
         if _run_cancel:
             _run_status["running"] = False
@@ -1702,7 +1702,7 @@ def get_dashboard_html() -> str:
                         }
                     }
                 } catch {}
-            }, 3000);
+            }, 1000);
         }
 
         async function checkRunStatus() {
