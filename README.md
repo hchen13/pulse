@@ -78,6 +78,47 @@ The dashboard (default port 8765) provides:
 - **Trends** — line charts for issues, PRs, and commits over time
 - **Agents** — view and edit the analyst's system prompt
 
+## Notifications
+
+Pulse supports two push mechanisms for report-ready events.
+
+### WebSocket
+
+Connect to the `/ws` endpoint (same host/port as the dashboard):
+
+```javascript
+const ws = new WebSocket('ws://your-host/pulse/ws');
+ws.onmessage = (e) => {
+  const event = JSON.parse(e.data);
+  if (event.type === 'report_ready') {
+    console.log('New report:', event.data);
+    // event.data = { date: "2025-03-26", repos: ["claude-code", ...] }
+  }
+};
+```
+
+The WS connection address, current status, and connected client count are shown in the **Settings** page of the dashboard. Toggle WebSocket on/off in `config.yaml` under `notification.websocket.enabled`.
+
+You can also check connection status via the API:
+
+```
+GET /api/ws/status
+→ { "enabled": true, "clients": 2 }
+```
+
+### Webhooks
+
+Configure HTTP webhook URLs in the Settings page (or `config.yaml`). On every successful report run, Pulse sends a POST to each URL:
+
+```json
+{
+  "event": "report_ready",
+  "date": "2025-03-26",
+  "repos": ["claude-code", "codex"],
+  "dashboard_url": "http://localhost:8765"
+}
+```
+
 ## Configuration
 
 Edit `config.yaml`:

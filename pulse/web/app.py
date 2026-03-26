@@ -269,6 +269,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     _ws_clients.remove(websocket)
             logger.info(f"[ws] 客户端断开，当前连接数: {len(_ws_clients)}")
 
+    @app.get("/api/ws/status")
+    async def get_ws_status():
+        cfg_path = _load_config_path()
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            ws_enabled = raw.get("notification", {}).get("websocket", {}).get("enabled", True)
+        except Exception:
+            ws_enabled = True
+        with _ws_clients_lock:
+            clients = len(_ws_clients)
+        return {"enabled": ws_enabled, "clients": clients}
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return get_dashboard_html()
@@ -926,6 +939,8 @@ def get_dashboard_html() -> str:
         .agent-card-header h2 { font-size: 15px; color: #e0e2f0; font-weight: 600; }
         .agent-card-body { padding: 20px 24px; }
         .agent-card-actions { display: flex; gap: 8px; }
+        .agent-card .edit-btn { opacity: 0; transition: opacity 0.2s; }
+        .agent-card:hover .edit-btn { opacity: 1; }
         .agent-textarea {
             width: 100%; min-height: 400px; background: #1e2030;
             color: #c0caf5; border: 1px solid #2a2d3e; border-radius: 6px;
@@ -1652,7 +1667,7 @@ def get_dashboard_html() -> str:
                     <div class="agent-card-header">
                         <h2>${escapeHtml(agent.name)}</h2>
                         <div class="agent-card-actions" id="agent-actions-${agent.id}">
-                            <button class="btn btn-primary btn-sm" onclick="editAgent('${agent.id}')">编辑</button>
+                            <button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agent.id}')">编辑</button>
                         </div>
                     </div>
                     <div class="agent-card-body">
@@ -1690,7 +1705,7 @@ def get_dashboard_html() -> str:
             viewEl.style.display = 'block';
 
             const actionsEl = document.getElementById(`agent-actions-${agentId}`);
-            actionsEl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="editAgent('${agentId}')">编辑</button>`;
+            actionsEl.innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
         }
 
         async function saveAgent(agentId) {
@@ -1718,7 +1733,7 @@ def get_dashboard_html() -> str:
                 viewEl.style.display = 'block';
 
                 const actionsEl = document.getElementById(`agent-actions-${agentId}`);
-                actionsEl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="editAgent('${agentId}')">编辑</button>`;
+                actionsEl.innerHTML = `<button class="btn btn-primary btn-sm edit-btn" onclick="editAgent('${agentId}')">编辑</button>`;
             } catch (e) {
                 if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
                 alert(`保存失败: ${e.message}`);
@@ -1729,6 +1744,61 @@ def get_dashboard_html() -> str:
 
         let _ws = null;
         let _wsReconnectTimer = null;
+        let _wsConnected = false;
+
+        function _wsStatusChanged() {
+            // 如果 Settings 页面正在展示，刷新 WS 信息区
+            const activeTab = document.querySelector('.tab.active');
+            if (activeTab) {
+                const onclick = activeTab.getAttribute('onclick') || '';
+                if (onclick.includes('settings')) refreshWsInfo();
+            }
+        }
+
+        async function refreshWsInfo() {
+            const el = document.getElementById('ws-info-area');
+            if (!el) return;
+            try {
+                const s = await fetchJSON('api/ws/status');
+                const wsUrl = (() => {
+                    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    return `${proto}//${location.host}${_basePath}/ws`;
+                })();
+                const connStatus = _wsConnected
+                    ? '<span style="color:#9ece6a;">已连接 ✓</span>'
+                    : '<span style="color:#f7768e;">未连接 ✗</span>';
+                el.innerHTML = `
+                    <div style="margin-top:16px; padding:14px 16px; background:#1e2030; border:1px solid #2a2d3e; border-radius:6px;">
+                        <div style="margin-bottom:10px;">
+                            <span style="font-size:12px; color:#565f89; text-transform:uppercase; letter-spacing:0.5px;">连接地址</span><br>
+                            <code style="font-size:12.5px; color:#f7768e; background:#16161e; padding:3px 8px; border-radius:4px; border:1px solid #2a2d3e; display:inline-block; margin-top:4px; word-break:break-all;">${wsUrl}</code>
+                        </div>
+                        <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:10px;">
+                            <div>
+                                <span style="font-size:12px; color:#565f89; text-transform:uppercase; letter-spacing:0.5px;">当前状态</span><br>
+                                <span style="font-size:13px; margin-top:3px; display:inline-block;">${connStatus}</span>
+                            </div>
+                            <div>
+                                <span style="font-size:12px; color:#565f89; text-transform:uppercase; letter-spacing:0.5px;">在线客户端</span><br>
+                                <span style="font-size:13px; color:#e0e2f0; margin-top:3px; display:inline-block;">${s.clients} 个</span>
+                            </div>
+                        </div>
+                        <div style="font-size:12px; color:#565f89; margin-bottom:10px;">订阅此地址，报告生成后推送 <code style="color:#bb9af7; font-size:11.5px;">report_ready</code> 事件</div>
+                        <details style="margin-top:6px;">
+                            <summary style="font-size:12px; color:#7aa2f7; cursor:pointer; user-select:none;">示例代码</summary>
+                            <pre style="margin-top:8px; background:#16161e; border:1px solid #2a2d3e; border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:12.5px; color:#cdd6f4; line-height:1.6;"><code>const ws = new WebSocket('${wsUrl}');
+ws.onmessage = (e) =&gt; {
+  const event = JSON.parse(e.data);
+  if (event.type === 'report_ready') {
+    console.log('New report:', event.data);
+  }
+};</code></pre>
+                        </details>
+                    </div>`;
+            } catch (e) {
+                el.innerHTML = `<div class="error-msg" style="margin-top:12px;">WS 状态加载失败: ${e.message}</div>`;
+            }
+        }
 
         function connectWebSocket() {
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1737,6 +1807,8 @@ def get_dashboard_html() -> str:
                 _ws = new WebSocket(wsUrl);
                 _ws.onopen = () => {
                     console.log('[ws] 已连接');
+                    _wsConnected = true;
+                    _wsStatusChanged();
                     if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
                 };
                 _ws.onmessage = (e) => {
@@ -1764,13 +1836,18 @@ def get_dashboard_html() -> str:
                 _ws.onclose = () => {
                     console.log('[ws] 连接断开，5秒后重连...');
                     _ws = null;
+                    _wsConnected = false;
+                    _wsStatusChanged();
                     _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
                 };
                 _ws.onerror = () => {
                     _ws = null;
+                    _wsConnected = false;
+                    _wsStatusChanged();
                 };
             } catch (e) {
                 console.log('[ws] 连接失败，5秒后重试');
+                _wsConnected = false;
                 _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
             }
         }
@@ -1827,6 +1904,7 @@ def get_dashboard_html() -> str:
                         </label>
                         <span style="font-size:13px; color:#a9b1d6;" id="ws-toggle-label">${wsEnabled ? '已开启' : '已关闭'}</span>
                     </div>
+                    <div id="ws-info-area"></div>
                 </div>
 
                 <div class="settings-section">
@@ -1848,6 +1926,9 @@ def get_dashboard_html() -> str:
             document.getElementById('ws-toggle').addEventListener('change', function() {
                 document.getElementById('ws-toggle-label').textContent = this.checked ? '已开启' : '已关闭';
             });
+
+            // 渲染 WS 连接信息
+            refreshWsInfo();
         }
 
         async function saveSchedule() {
