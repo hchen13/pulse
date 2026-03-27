@@ -9,12 +9,15 @@ Pulse monitors the most active open-source AI agent harness projects — trackin
 ## What it does
 
 - **Collects** GitHub activity (issues, PRs, commits across all branches, releases) for watched repositories
-- **Analyzes** each dimension independently using LLM agents, producing daily insight reports from four angles:
-  - User pain points and demands (from issues & feature requests)
-  - Community focus (from PRs & reviews)
-  - Official direction (from merged PRs & branch commits)
-  - Release cadence & progress (from main branch commits, releases, tags)
-- **Visualizes** trends via a web dashboard with multi-project line charts
+- **Analyzes** via a three-layer LLM pipeline running in parallel:
+  - **Dimension analysis** (4 independent analysts): user pain points, community focus, official direction, release cadence
+  - **Project synthesis**: merges 4 dimension reports into a single per-project report
+  - **Global synthesis**: cross-project distillation for ecosystem-level insight
+- **Dual-audience report format** — every section has two segments:
+  - **Plain talk** — plain language conclusions anyone can understand
+  - **Tech talk** — technical details with data, for AI agent developers
+- **Founder's lens** — each report includes a "Founder's Window" section surfacing market gaps backed by evidence from this cycle's data
+- **Visualizes** trends via a web dashboard with multi-project line charts (matrix green palette, per-repo avatar at line end)
 - **Runs on a schedule** — daemon mode with configurable cron, or trigger manually
 
 ## Default watchlist
@@ -76,9 +79,10 @@ pulse run
 The dashboard (default port 8765) provides:
 
 - **Overview** — key metrics across all projects, today's insights
-- **Daily Report** — full analysis with markdown rendering
-- **Trends** — line charts for issues, PRs, and commits over time
-- **Agents** — view and edit the analyst's system prompt
+- **Daily Report** — full analysis with markdown rendering (terminal green theme, dual-segment format)
+- **Trends** — line charts for issues, PRs, and commits over time (matrix green palette, repo avatar at line end)
+- **Workflow** — view and edit analyst system prompts inline
+- **Settings** — schedule config, WebSocket toggle, webhook management
 
 ## Notifications
 
@@ -139,9 +143,13 @@ web:
 
 ```
 pulse/
-├── config.yaml          # Runtime configuration
-├── .claude/CLAUDE.md    # Analyst agent persona & output rules
-├── data/pulse.db        # SQLite storage (auto-cleaned, 40-day rolling)
+├── config.yaml              # Runtime configuration
+├── .claude/analysts/        # Analyst system prompts (editable via dashboard)
+│   ├── issues.md            # User research analyst
+│   ├── prs.md               # Community ecosystem analyst
+│   ├── commits.md           # Engineering direction analyst
+│   └── synthesis.md         # Synthesis analyst (dual-segment format + founder's lens)
+├── data/pulse.db            # SQLite storage (auto-cleaned, 40-day rolling)
 ├── pulse/
 │   ├── cli.py           # CLI entry point
 │   ├── daemon.py        # Scheduled runner

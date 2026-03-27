@@ -9,12 +9,15 @@ Pulse 监控最活跃的 AI agent harness 开源项目——追踪 issues、pull
 ## 功能
 
 - **采集** 监控项目的 GitHub 活动（issues、PRs、所有分支的 commits、releases）
-- **分析** 由 4 个独立 LLM 分析师从不同角度生成每日洞察报告：
-  - 用户痛点与需求（来自 issues 和 feature requests）
-  - 社区关注点（来自 PRs 和 reviews）
-  - 官方工作重心（来自 merged PRs 和分支 commits）
-  - 版本进度与节奏（来自 main 分支 commits、releases、tags）
-- **可视化** 通过 Web Dashboard 展示多项目趋势面积图
+- **分析** 三层 LLM 分析流水线并行执行：
+  - **维度分析**（4个独立分析师并行）：用户痛点、社区动向、官方工作重心、版本节奏
+  - **项目合成**：将 4 份维度报告合并为单项目综合报告
+  - **全局综合**：跨项目提炼，生成赛道级洞察报告
+- **双段报告格式** 每个章节包含两段，面向不同读者：
+  - **说人话** — 大白话，任何人可读，直接说结论
+  - **说行话** — 技术细节 + 数量支撑，面向 AI agent 开发者
+- **创业者视角** 报告包含「创业者的窗口」章节，基于本期信号推断可切入的方向
+- **可视化** Web Dashboard 展示多项目趋势折线图（matrix 绿配色，线尾项目 logo）
 - **定时运行** 支持 daemon 模式定时执行，也可手动触发
 
 ## 默认监控列表
@@ -77,9 +80,9 @@ pulse run
 Dashboard（默认端口 8765）包含：
 
 - **概览** — 所有项目的关键指标 + 今日洞察
-- **日报** — 完整分析报告，Markdown 渲染
-- **趋势** — Issues / PRs / Commits 面积图，支持多项目对比
-- **Agents** — 查看和编辑 4 个分析师的 system prompt
+- **日报** — 完整分析报告，Markdown 渲染（终端绿主题，双段结构）
+- **趋势** — Issues / PRs / Commits 多项目折线图（matrix 绿配色，线尾显示项目 logo）
+- **Workflow** — 分析师配置（system prompt 可在线编辑）
 - **Settings** — 定时配置、WebSocket 开关、Webhook 管理
 
 ## 通知机制
@@ -143,11 +146,11 @@ notification:
 ```
 pulse/
 ├── config.yaml              # 运行时配置
-├── .claude/analysts/        # 4 个分析师的 system prompt
-│   ├── issues.md            # 用户研究分析师
-│   ├── prs.md               # 社区生态分析师
-│   ├── commits.md           # 工程方向分析师
-│   └── synthesis.md         # 战略综合分析师
+├── .claude/analysts/        # 分析师 system prompt（可在 Dashboard 在线编辑）
+│   ├── issues.md            # 用户研究分析师（Issues → 用户痛点）
+│   ├── prs.md               # 社区生态分析师（Open PRs → 社区动向）
+│   ├── commits.md           # 工程方向分析师（Merged PRs + Commits → 官方方向）
+│   └── synthesis.md         # 综合分析师（跨项目提炼 + 双段报告格式 + 创业者视角）
 ├── data/pulse.db            # SQLite 存储（40 天滚动清理）
 ├── pulse/
 │   ├── cli.py               # CLI 入口
