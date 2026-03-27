@@ -241,7 +241,7 @@ def _run_full_cycle():
                 _sync_steps_to_status()
             broadcast_event(event_type, data)
 
-        collector = GitHubCollector(cfg.collection, cfg.storage.db_path)
+        collector = GitHubCollector(cfg.collection, cfg.storage.db_path, cancel_check=lambda: _run_cancel)
         analyzer = LLMAnalyzer(cfg.analysis, cfg.storage.db_path, broadcast_fn=tracked_broadcast)
 
         repo_reports = {}
@@ -258,6 +258,7 @@ def _run_full_cycle():
         fetch_start = _time.time()
         with ThreadPoolExecutor(max_workers=len(repos) or 1) as executor:
             def _fetch_repo(repo):
+                if _run_cancel: return repo.full_name
                 t0 = _time.time()
                 tracked_broadcast("step_start", {"step": f"fetch/{repo.full_name}", "run_id": run_id})
                 logger.info(f"[run] 采集 {repo.full_name}")

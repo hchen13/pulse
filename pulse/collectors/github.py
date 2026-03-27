@@ -36,16 +36,23 @@ def _run_gh(args: List[str]) -> Optional[Any]:
 
 
 class GitHubCollector:
-    def __init__(self, config: CollectionConfig, db_path: str):
+    def __init__(self, config: CollectionConfig, db_path: str, cancel_check=None):
         self.config = config
         self.db_path = db_path
+        self._cancel_check = cancel_check or (lambda: False)
+
+    def _is_cancelled(self):
+        return self._cancel_check()
 
     def fetch_all(self, repo: RepoConfig) -> Dict[str, int]:
         """采集所有维度数据，返回各维度的数量"""
         results = {}
         results["issues"] = self.fetch_issues(repo)
+        if self._is_cancelled(): return results
         results["prs"] = self.fetch_prs(repo)
+        if self._is_cancelled(): return results
         results["commits"] = self.fetch_commits(repo)
+        if self._is_cancelled(): return results
         results["releases"] = self.fetch_releases(repo)
         return results
 
@@ -208,6 +215,7 @@ class GitHubCollector:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def _fetch_branch_commits(branch):
+            if self._is_cancelled(): return branch, []
             data = _run_gh([
                 "api",
                 f"repos/{full_name}/commits",
