@@ -209,26 +209,36 @@ def _run_full_cycle():
         })
 
         # Wrapper: intercept step_start/step_done to update _run_status
+        def _sync_steps_to_status():
+            """Sync _step_states → _run_status["steps"]"""
+            with _run_lock:
+                _run_status["elapsed_s"] = round(time.time() - start_time, 1)
+                _run_status["steps"] = [
+                    {"name": k, "status": v["status"], "duration_s": v["duration_s"],
+                     "started_at": v.get("started_at"), "finished_at": v.get("finished_at")}
+                    for k, v in _step_states.items()
+                ]
+
         def tracked_broadcast(event_type: str, data: dict):
             if event_type == "step_start":
                 step_name = data.get("step", "")
-                _step_states[step_name] = {"status": "running", "duration_s": None}
+                _step_states[step_name] = {
+                    "status": "running", "duration_s": None,
+                    "started_at": datetime.now().strftime("%H:%M:%S"), "finished_at": None,
+                }
                 with _run_lock:
                     _run_status["current_step"] = step_name
-                    _run_status["elapsed_s"] = round(time.time() - start_time, 1)
+                _sync_steps_to_status()
             elif event_type == "step_done":
                 step_name = data.get("step", "")
+                prev = _step_states.get(step_name, {})
                 _step_states[step_name] = {
                     "status": "done",
                     "duration_s": data.get("duration_s"),
+                    "started_at": prev.get("started_at"),
+                    "finished_at": datetime.now().strftime("%H:%M:%S"),
                 }
-                done_count = sum(1 for s in _step_states.values() if s["status"] == "done")
-                with _run_lock:
-                    _run_status["elapsed_s"] = round(time.time() - start_time, 1)
-                    _run_status["steps"] = [
-                        {"name": k, "status": v["status"], "duration_s": v["duration_s"]}
-                        for k, v in _step_states.items()
-                    ]
+                _sync_steps_to_status()
             broadcast_event(event_type, data)
 
         collector = GitHubCollector(cfg.collection, cfg.storage.db_path)
@@ -2078,9 +2088,15 @@ def get_dashboard_html() -> str:
             const durStr = fmtSeconds(duration);
 
             // Use data-* attributes to avoid quote escaping in onclick
-            // Calculate start time from created_at - duration_s
+            // Show start time immediately, end time when done
             let timeStr = '';
-            if (step.created_at && duration > 0) {
+            if (step.started_at) {
+                timeStr = step.started_at;
+                if (step.finished_at) {
+                    timeStr += ` → ${step.finished_at}`;
+                }
+            } else if (step.created_at && duration > 0) {
+                // Fallback for DB records
                 const endTime = new Date(step.created_at.replace(' ', 'T') + 'Z');
                 const startTime = new Date(endTime.getTime() - duration * 1000);
                 const fmt = (d) => d.toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});

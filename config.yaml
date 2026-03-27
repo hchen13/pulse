@@ -17,7 +17,7 @@ collection:
   max_commits_per_branch: 20
   max_releases: 10
 schedule:
-  cron: 0 6 * * *
+  cron: 50 11 * * *
 analysis:
   claude_bin: /Users/claire/.local/bin/claude
   model: claude-haiku-4-5
