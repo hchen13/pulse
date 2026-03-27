@@ -646,6 +646,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             if not _run_status["running"]:
                 return {"status": "not_running"}
             _run_cancel = True
+        # Kill running claude subprocesses for faster stop
+        import subprocess as _sp
+        try:
+            _sp.run(["pkill", "-f", "claude.*--model.*haiku\\|claude.*--model.*sonnet"], capture_output=True, timeout=5)
+        except Exception:
+            pass
         return {"status": "stopping"}
 
     @app.get("/api/run/status")
@@ -1689,7 +1695,8 @@ def get_dashboard_html() -> str:
                             await loadTodayInsight();
                             await loadWorkflowTimeline();
                         }
-                        if (s.error) alert(`分析出错: ${s.error}`);
+                        // 取消不弹提示，只有真正的错误才提示
+                        if (s.error && s.error !== '已取消') alert(`分析出错: ${s.error}`);
                     } else {
                         const elapsed = s.elapsed_s ? Math.round(s.elapsed_s) + 's' : '';
                         // 按阶段显示进度
