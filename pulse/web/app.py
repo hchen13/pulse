@@ -1640,11 +1640,11 @@ def get_dashboard_html() -> str:
             const btn = document.getElementById('btn-run');
             // If running, stop it
             if (btn.dataset.state === 'running') {
+                if (!confirm('确认停止当前分析？')) return;
                 btn.disabled = true;
                 try {
                     await fetchJSON('api/run/stop', { method: 'POST' });
                 } catch(e) {}
-                btn.disabled = false;
                 return;
             }
             // Start new run
