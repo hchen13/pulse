@@ -1543,6 +1543,17 @@ def get_dashboard_html() -> str:
         </div>
     </div>
 
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="modal-overlay" onclick="if(event.target===this)closeConfirmModal()">
+        <div class="modal" style="max-width:360px; text-align:center;">
+            <p id="confirm-modal-text" style="font-size:14px; color:#e0e2f0; margin-bottom:20px;"></p>
+            <div class="modal-actions" style="justify-content:center;">
+                <button class="btn" style="background:#1e1e2e; color:#565f89; border-color:#2a2d3e;" onclick="closeConfirmModal()">取消</button>
+                <button class="btn" id="confirm-modal-ok" style="background:#f7768e; color:#fff; border:none;">确认停止</button>
+            </div>
+        </div>
+    </div>
+
     <!-- WS API Modal -->
     <div id="ws-api-modal" class="modal-overlay">
         <div class="modal" style="width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;">
@@ -1641,11 +1652,10 @@ def get_dashboard_html() -> str:
             const btn = document.getElementById('btn-run');
             // If running, stop it
             if (btn.dataset.state === 'running') {
-                if (!confirm('确认停止当前分析？')) return;
-                btn.disabled = true;
-                try {
-                    await fetchJSON('api/run/stop', { method: 'POST' });
-                } catch(e) {}
+                showConfirmModal('确认停止当前分析？', async () => {
+                    btn.disabled = true;
+                    try { await fetchJSON('api/run/stop', { method: 'POST' }); } catch(e) {}
+                });
                 return;
             }
             // Start new run
@@ -1666,6 +1676,16 @@ def get_dashboard_html() -> str:
                 alert(`启动失败: ${e.message}`);
                 btn.disabled = false;
             }
+        }
+
+        function showConfirmModal(text, onConfirm) {
+            document.getElementById('confirm-modal-text').textContent = text;
+            const okBtn = document.getElementById('confirm-modal-ok');
+            okBtn.onclick = () => { closeConfirmModal(); onConfirm(); };
+            document.getElementById('confirm-modal').classList.add('open');
+        }
+        function closeConfirmModal() {
+            document.getElementById('confirm-modal').classList.remove('open');
         }
 
         function resetRunButton() {
